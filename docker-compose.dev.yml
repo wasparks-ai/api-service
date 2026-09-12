@@ -20,7 +20,12 @@ services:
     ports:
       # Published locally so the service can reach it from the IDE. In production it is on the docker
       # network with NO host port (deploy §F) — nothing outside the compose network should reach Redis.
-      - "6379:6379"
+      #
+      # The host port is overridable because 6379 is not always free on a developer machine — another
+      # project's Redis may already hold it, and sharing one Redis across two projects means sharing a
+      # keyspace, which is how you lose a send queue to someone else's FLUSHALL. Set REDIS_HOST_PORT
+      # and point the service at it with REDIS_URL=redis://localhost:$REDIS_HOST_PORT.
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:

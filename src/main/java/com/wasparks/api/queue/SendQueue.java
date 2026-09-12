@@ -68,15 +68,35 @@ public class SendQueue {
             redis.opsForStream().createGroup(stream, ReadOffset.from("$"), group);
             log.info("Created consumer group {} on stream {}", group, stream);
         } catch (Exception e) {
-            String message = e.getMessage() == null ? "" : e.getMessage();
-            if (message.contains("BUSYGROUP")) {
+            if (isBusyGroup(e)) {
                 log.debug("Consumer group {} already exists on stream {}", group, stream);
             } else {
                 // Redis may simply not be up yet at startup. The workers retry, and a genuinely broken
                 // Redis will make itself known on the first send.
-                log.warn("Could not create consumer group {} on {}: {}", group, stream, message);
+                log.warn("Could not create consumer group {} on {}: {}", group, stream, e.getMessage());
             }
         }
+    }
+
+    /**
+     * Is this the expected "the group is already there" answer?
+     *
+     * <p>The whole cause chain has to be searched, not just the top message. Spring translates the
+     * Lettuce error into a {@code RedisSystemException} whose own message is the useless
+     * {@code "Error in execution"} — {@code BUSYGROUP} appears only further down the chain. Matching on
+     * {@code e.getMessage()} alone therefore never matches, and the one outcome this method exists to
+     * treat as normal gets logged as a warning on every restart after the first, which is every restart.
+     */
+    private static boolean isBusyGroup(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t.getMessage() != null && t.getMessage().contains("BUSYGROUP")) {
+                return true;
+            }
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return false;
     }
 
     /**
