@@ -21,6 +21,8 @@ app:
   public-base-url: http://localhost:8083
   encryption:
     secret-key: test-encryption-key-32-chars!!
+  cors:
+    allowed-origins: http://localhost:5173
   jwt:
     secret: test-tenants-jwt-secret-at-least-32-characters-long-for-hs256
     issuer: whatsapp-tenants-service

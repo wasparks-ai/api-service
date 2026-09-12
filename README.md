@@ -81,6 +81,7 @@ the real migrations, and the entities are validated against it exactly as they a
 | `INTERNAL_API_SECRET` | **prod, must match** | dev default | Shared bearer for `/internal/v1/**`. Identical to tenants-service. 32+ chars. |
 | `TENANTS_SERVICE_BASE_URL` | prod | `http://localhost:8081` | In compose: `http://tenants-service:8081`. |
 | `API_PUBLIC_BASE_URL` | no | `http://localhost:8083` | Shown in the docs and the quickstart. |
+| `APP_CORS_ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated browser origins allowed on `/v1/**` (tenant-web). Prod: `https://app.wasparks.com`. `/meta/**` stays CORS-disabled — nothing there is ever called from a browser. |
 | `SEND_WORKERS` | no | `8` | Send-worker threads. **`0` accepts sends but drains nothing** — a valid shape if you separate API and worker instances. |
 | `API_PREFLIGHT_ENABLED` | no | `true` | Upstream preflight. See below. |
 | `INTERNAL_TIMEOUT_MS` | no | `10000` | Timeout on every internal call. |
