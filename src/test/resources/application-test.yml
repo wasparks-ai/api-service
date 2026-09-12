@@ -1,0 +1,76 @@
+spring:
+  jpa:
+    # The same setting dev and prod run. The test schema is applied by Testcontainers' init script, so
+    # the entities are validated against the real 020 shapes rather than against DDL Hibernate invented
+    # to match them — which would make the mapping tests tautological.
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+
+  flyway:
+    enabled: false
+
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+
+app:
+  public-base-url: http://localhost:8083
+  encryption:
+    secret-key: test-encryption-key-32-chars!!
+  jwt:
+    secret: test-tenants-jwt-secret-at-least-32-characters-long-for-hs256
+    issuer: whatsapp-tenants-service
+  internal:
+    # Overridden per-test with the MockWebServer address where the internal client is exercised.
+    base-url: http://localhost:1
+    secret: test-internal-secret-at-least-32-characters-long
+    timeout-ms: 2000
+  api:
+    key-cache-ttl-seconds: 300
+    last-used-throttle-seconds: 60
+    preflight:
+      enabled: true
+    idempotency:
+      ttl-hours: 24
+    account-cache-ttl-seconds: 60
+    ui-session:
+      # Far future: the purge is driven directly in tests, never on a timer.
+      purge-cron: "0 0 3 1 1 *"
+  queue:
+    stream: sends-test
+    group: api-send-workers
+    # Zero workers: every queue test drives SendWorker.handle() directly so the assertions are
+    # deterministic. A background pool would race the test for the same stream entries.
+    workers: 0
+    max-len: 1000
+    block-ms: 200
+    claim-idle-ms: 1000
+    claim-interval-ms: 3600000
+    retry-backoff-ms: 5,10,15
+  webhook:
+    # The scheduled pollers are effectively off (one hour); every webhook test invokes the poller and
+    # dispatcher directly, so nothing fires underneath an assertion.
+    outbox-poll-ms: 3600000
+    outbox-batch: 500
+    dispatch-poll-ms: 3600000
+    dispatch-batch: 200
+    timeout-ms: 2000
+    retry-backoff-ms: 10000,60000,300000,1800000,7200000
+    pause-after-failures: 100
+    sandbox:
+      delivered-delay-ms: 2000
+  usage:
+    flush-ms: 3600000
+    flush-initial-delay-ms: 3600000
+
+logging:
+  level:
+    root: WARN
+    com.wasparks.api: INFO
+    org.hibernate.SQL: WARN
+    org.testcontainers: WARN
+    com.github.dockerjava: WARN

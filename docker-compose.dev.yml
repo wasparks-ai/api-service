@@ -1,0 +1,33 @@
+# Local development dependencies for wasparks-api-service.
+#
+# This file starts Redis and nothing else. The service itself runs from Eclipse, and PostgreSQL is the
+# shared instance the other services already use — but Redis has no other home in this estate (this is
+# the only service that talks to it), so it has to come from somewhere, and that somewhere is here.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Stop it with `down`. Add `-v` only if you want the queue wiped: the volume holds the `sends` stream,
+# and removing it drops anything queued but not yet sent.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: wasparks-dev-redis
+    # Append-only persistence. Without it a restart loses the send queue, the idempotency records and
+    # the usage counters that have not been flushed yet — survivable in development, but it makes
+    # "where did my queued message go?" a confusing hour.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      # Published locally so the service can reach it from the IDE. In production it is on the docker
+      # network with NO host port (deploy §F) — nothing outside the compose network should reach Redis.
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redisdata:

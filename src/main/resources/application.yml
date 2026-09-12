@@ -1,0 +1,164 @@
+spring:
+  application:
+    name: wasparks-api-service
+
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+
+  # NO Flyway (shared-contracts §4). Schema is applied by hand from modules/_shared/database/*.sql;
+  # this service needs 020_api_ecosystem.sql. ddl-auto=validate is the safety net in its place.
+  flyway:
+    enabled: false
+
+  # The only Redis in the estate (epic §0.1). Everything hot lives here: the API-key cache, the
+  # fixed-window rate-limit counters, message quotas, idempotency records, usage buckets, and the
+  # `sends` Stream. Losing Redis loses the queue — it is `--appendonly yes` in compose for that reason.
+  data:
+    redis:
+      url: ${REDIS_URL:redis://localhost:6379}
+      timeout: 2s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      # STRICT, unlike the other services. The Meta-compatible send endpoint must reject an unknown
+      # field with 400 code 100 (epic §B5): a client that typed "tempate" or sent an `interactive`
+      # block we do not support has to hear it now, not discover from its customer that a 202 produced
+      # a message it did not mean. Every DTO we deserialize from UPSTREAM carries
+      # @JsonIgnoreProperties(ignoreUnknown = true) explicitly, so tenants-service adding a response
+      # field is still not a breaking change.
+      fail-on-unknown-properties: true
+    default-property-inclusion: non_null
+    time-zone: UTC
+
+server:
+  port: 8083
+  servlet:
+    context-path: /
+  error:
+    include-message: always
+    include-binding-errors: always
+    include-stacktrace: never
+    include-exception: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+
+# Swagger UI at /docs (epic §B9); nginx maps developers.wasparks.com here. Two groups, `meta` and `v1`,
+# wired in OpenApiConfig.
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /docs
+    disable-swagger-default-url: true
+    operations-sorter: method
+    tags-sorter: alpha
+
+logging:
+  level:
+    root: INFO
+    com.wasparks.api: DEBUG
+
+app:
+  # Shown in docs and in the quickstart the tenant sees in tenant-web.
+  public-base-url: ${API_PUBLIC_BASE_URL:http://localhost:8083}
+
+  # Must match tenants-service AND admin-service exactly or webhook secrets written by one service
+  # cannot be read by another (shared-contracts §1). AES-256-GCM, EncryptionUtil is a byte-for-byte port.
+  encryption:
+    secret-key: ${ENCRYPTION_SECRET:your-aes-256-encryption-key-32c}
+
+  # /v1/keys/** ONLY (epic §0.12). The same secret and issuer tenants-service signs with; we validate,
+  # never issue. No other endpoint on this service accepts a JWT.
+  jwt:
+    secret: ${TENANTS_JWT_SECRET:tenants-service-256-bit-secret-key-must-be-at-least-32-characters-long}
+    issuer: whatsapp-tenants-service
+
+  # The docker-network-only call into tenants-service (§C1). INTERNAL_API_SECRET is the shared bearer;
+  # it must be identical in tenants-service.env. Prod refuses to boot on the dev default.
+  internal:
+    base-url: ${TENANTS_SERVICE_BASE_URL:http://localhost:8081}
+    secret: ${INTERNAL_API_SECRET:dev-only-internal-secret-not-for-prod-0123456789}
+    timeout-ms: ${INTERNAL_TIMEOUT_MS:10000}
+
+  api:
+    # Resolved API keys are cached by sha256 hash so a hot key is one Redis GET, not a DB hit.
+    # A revoke evicts the entry immediately; the TTL only bounds an out-of-band UPDATE (admin-webapp
+    # revoke writes the row directly — epic §E documents the ≤5 min window).
+    key-cache-ttl-seconds: ${API_KEY_CACHE_TTL_SECONDS:300}
+    # last_used_at is interesting, not critical: one write per key per minute instead of one per request.
+    last-used-throttle-seconds: ${API_LAST_USED_THROTTLE_SECONDS:60}
+    # Upstream preflight (§B5). Default ON. Turn OFF only to develop against a tenants-service that
+    # has not shipped POST /internal/v1/messages/validate yet: local checks still run, and the worker's
+    # real send re-runs everything upstream, so the cost of OFF is a 202 that later becomes
+    # message.failed instead of a synchronous 4xx.
+    preflight:
+      enabled: ${API_PREFLIGHT_ENABLED:true}
+    # The 1h TEST key tenant-web authenticates its own Developer section with (§D.3).
+    # Expired rows are dead already — this only stops the table growing a row per visit.
+    ui-session:
+      purge-cron: ${API_UI_SESSION_PURGE_CRON:0 30 3 * * *}
+    # Idempotency-Key records (epic §B4). 24h, per the documented client contract.
+    idempotency:
+      ttl-hours: ${API_IDEMPOTENCY_TTL_HOURS:24}
+    # The phone_number_id -> account ownership check on the Meta send path. Short TTL: an account
+    # going DISCONNECTED must start rejecting quickly.
+    account-cache-ttl-seconds: ${API_ACCOUNT_CACHE_TTL_SECONDS:60}
+
+  # The `sends` Redis Stream (epic §B6). One stream, one consumer group, N worker threads.
+  queue:
+    stream: ${SEND_STREAM:sends}
+    group: api-send-workers
+    workers: ${SEND_WORKERS:8}
+    max-len: ${SEND_STREAM_MAXLEN:100000}
+    block-ms: ${SEND_BLOCK_MS:2000}
+    # XAUTOCLAIM sweep: an entry a dead consumer never ACKed is reclaimed after this long.
+    claim-idle-ms: ${SEND_CLAIM_IDLE_MS:300000}
+    claim-interval-ms: ${SEND_CLAIM_INTERVAL_MS:60000}
+    # Upstream 5xx/timeout retries inside the worker before the message is failed upstream_unavailable.
+    retry-backoff-ms: ${SEND_RETRY_BACKOFF_MS:2000,10000,30000}
+
+  # Outbound webhooks (epic §B8). Poller drains the outbox; dispatcher delivers with HMAC signatures.
+  webhook:
+    outbox-poll-ms: ${WEBHOOK_OUTBOX_POLL_MS:2000}
+    outbox-batch: ${WEBHOOK_OUTBOX_BATCH:500}
+    dispatch-poll-ms: ${WEBHOOK_DISPATCH_POLL_MS:1000}
+    dispatch-batch: ${WEBHOOK_DISPATCH_BATCH:200}
+    timeout-ms: ${WEBHOOK_TIMEOUT_MS:10000}
+    # 10s, 1m, 5m, 30m, 2h then EXHAUSTED. Five entries = five retries after the first attempt.
+    retry-backoff-ms: ${WEBHOOK_RETRY_BACKOFF_MS:10000,60000,300000,1800000,7200000}
+    # Consecutive failures before the endpoint is PAUSED (epic §B8).
+    pause-after-failures: ${WEBHOOK_PAUSE_AFTER_FAILURES:100}
+    # Sandbox synthesiser (epic §0.10): a TEST-mode accept produces these two events, this far out.
+    sandbox:
+      delivered-delay-ms: ${WEBHOOK_SANDBOX_DELIVERED_DELAY_MS:2000}
+
+  # Redis usage counters flushed into api_usage_daily (epic §B3). The DB row is the billing truth.
+  usage:
+    flush-ms: ${USAGE_FLUSH_MS:600000}          # 10 min
+    flush-initial-delay-ms: ${USAGE_FLUSH_INITIAL_DELAY_MS:60000}

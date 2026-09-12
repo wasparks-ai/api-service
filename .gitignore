@@ -1,0 +1,40 @@
+# Build output
+target/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+src/main/resources/application-dev.yml
+src/main/resources/application-prod.yml
+
+# Claude AI
+.claude/
+CLAUDE.md
+.mcp.json
+
+# Markdown docs (keep only README.md and the published developer docs)
+*.md
+!README.md
+# docs/quickstart.md is a deliverable, not a working note — it is what developers.wasparks.com links
+# to, so it has to be in the repo (api-ecosystem epic §B9).
+!docs/*.md
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# IntelliJ
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Shell scripts (local ops, may contain credentials)
+*.sh
+
+# Logs
+*.log
