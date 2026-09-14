@@ -20,7 +20,15 @@ Postgres you already have; Redis you do not, and it is the one thing you will ne
 docker compose -f docker-compose.dev.yml up -d
 ```
 
-That starts `redis:7-alpine` on `localhost:6379` with append-only persistence. Then run
+That starts `redis:7-alpine` on `localhost:6379` with append-only persistence. If something else on the
+machine already holds 6379 (`Bind for 0.0.0.0:6379 failed: port is already allocated`), give this one
+its own port rather than sharing a keyspace with another project:
+
+```bash
+REDIS_HOST_PORT=6380 docker compose -f docker-compose.dev.yml up -d
+```
+
+and set `REDIS_URL=redis://localhost:6380` in the launch configuration. Then run
 `ApiServiceApplication` from Eclipse, or:
 
 ```bash
@@ -39,8 +47,8 @@ Swagger UI is at <http://localhost:8083/docs>, and the hand-written quickstart i
 
 ### Schema
 
-No Flyway (shared-contracts §4). Apply `modules/_shared/database/020_api_ecosystem.sql` by hand, once
-per environment, before first boot — `ddl-auto=validate` will refuse to start otherwise, which is the
+No Flyway (shared-contracts §4). Apply `modules/_shared/database/020_api_ecosystem.sql` and then
+`020a_api_keys_ui_session.sql` by hand, once per environment, before first boot — `ddl-auto=validate` will refuse to start otherwise, which is the
 point.
 
 ### Tests
@@ -66,13 +74,14 @@ the real migrations, and the entities are validated against it exactly as they a
 |---|---|---|---|
 | `DB_URL` | prod | `jdbc:postgresql://localhost:5432/whatsapp_admin` | The shared database. Same instance as admin-service and tenants-service. |
 | `DB_USERNAME` | prod | `postgres` | |
-| `DB_PASSWORD` | prod | `postgres` | |
+| `DB_PASSWORD` | prod | `admin123` | The shared dev password the other two services default to. |
 | `REDIS_URL` | prod | `redis://localhost:6379` | The only Redis in the estate. In compose: `redis://redis:6379`. |
 | `ENCRYPTION_SECRET` | **prod, must match** | dev default | AES-256-GCM key for webhook secrets. **Identical to admin-service and tenants-service** or values written by one cannot be read by another (shared-contracts §1). |
 | `TENANTS_JWT_SECRET` | **prod, must match** | dev default | HS256 key used to *verify* tenant sessions on `/v1/keys`. Identical to tenants-service. 32+ chars. |
 | `INTERNAL_API_SECRET` | **prod, must match** | dev default | Shared bearer for `/internal/v1/**`. Identical to tenants-service. 32+ chars. |
 | `TENANTS_SERVICE_BASE_URL` | prod | `http://localhost:8081` | In compose: `http://tenants-service:8081`. |
 | `API_PUBLIC_BASE_URL` | no | `http://localhost:8083` | Shown in the docs and the quickstart. |
+| `APP_CORS_ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated browser origins allowed on `/v1/**` (tenant-web). Prod: `https://app.wasparks.com`. `/meta/**` stays CORS-disabled — nothing there is ever called from a browser. |
 | `SEND_WORKERS` | no | `8` | Send-worker threads. **`0` accepts sends but drains nothing** — a valid shape if you separate API and worker instances. |
 | `API_PREFLIGHT_ENABLED` | no | `true` | Upstream preflight. See below. |
 | `INTERNAL_TIMEOUT_MS` | no | `10000` | Timeout on every internal call. |
