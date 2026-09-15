@@ -2,6 +2,7 @@ package com.wasparks.api.plans;
 
 import com.wasparks.api.entity.ApiPlan;
 import com.wasparks.api.entity.TenantApiPlan;
+import com.wasparks.api.enums.BillingModel;
 import com.wasparks.api.enums.OveragePolicy;
 import com.wasparks.api.repository.ApiPlanRepository;
 import com.wasparks.api.repository.TenantApiPlanRepository;
@@ -71,7 +72,14 @@ public class PlanResolver {
                 intOr(overrides, "maxKeys", plan.getMaxKeys()),
                 intOr(overrides, "maxWebhookEndpoints", plan.getMaxWebhookEndpoints()),
                 policyOr(overrides, plan.getOveragePolicy()),
-                boolOr(overrides, "sandboxOnly", plan.isSandboxOnly()));
+                boolOr(overrides, "sandboxOnly", plan.isSandboxOnly()),
+                // Billing is not overridable. A per-tenant override that flipped FIXED to METERED would
+                // change what the tenant is invoiced for from a JSON blob nobody reviews; the plan row
+                // admin-webapp edits is the only place that decision is made (§0.9).
+                plan.getBillingModel() == null ? BillingModel.FIXED : plan.getBillingModel(),
+                plan.getPricePerMessageMinor(),
+                plan.getCurrency(),
+                plan.isPartnerPlan());
     }
 
     private int intOr(Map<String, Object> overrides, String key, Integer planValue) {

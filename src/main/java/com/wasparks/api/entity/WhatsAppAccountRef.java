@@ -69,4 +69,16 @@ public class WhatsAppAccountRef {
 
     @Column(name = "token_error_code", length = 16)
     private String tokenErrorCode;
+
+    /**
+     * How the number was connected (021 §5): {@code ES} through a hosted setup link, {@code DIRECT}
+     * through {@code POST /v1/customers/{id}/phone-numbers}, {@code MANUAL} by an admin, and null for a
+     * row that predates the column.
+     *
+     * <p>Reported to a partner because the two paths fail differently and it is the first thing support
+     * asks: a DIRECT number that stops receiving is a WABA whose sharing was revoked, while an ES number
+     * that stops is an expired token.
+     */
+    @Column(name = "mapped_via", length = 8)
+    private String mappedVia;
 }

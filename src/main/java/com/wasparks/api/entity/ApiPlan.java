@@ -1,5 +1,6 @@
 package com.wasparks.api.entity;
 
+import com.wasparks.api.enums.BillingModel;
 import com.wasparks.api.enums.OveragePolicy;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -72,6 +73,29 @@ public class ApiPlan {
     /** A sandbox-only plan may issue LIVE keys but every send is forced to the DRYRUN path. */
     @Column(name = "sandbox_only", nullable = false)
     private boolean sandboxOnly;
+
+    /**
+     * FIXED = the allowance above with {@link OveragePolicy} past it; METERED = no meaningful allowance,
+     * every accepted message priced (epic §0.9). The seeded PARTNER_* plans are one of each.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "billing_model", nullable = false, length = 8)
+    private BillingModel billingModel;
+
+    /** Minor units, never a float (the 019 rule). NULL on a FIXED plan; required on a METERED one. */
+    @Column(name = "price_per_message_minor")
+    private Long pricePerMessageMinor;
+
+    @Column(name = "currency", length = 3)
+    private String currency;
+
+    /**
+     * Assignable only to a partner's owner tenant, and its allowance <b>pools</b> across every client of
+     * that partner (§0.9). admin-service enforces the assignment rule in both directions; this service
+     * reads the flag to know whether {@code messagesPerDay} means "this tenant" or "this partner".
+     */
+    @Column(name = "partner_plan", nullable = false)
+    private boolean partnerPlan;
 
     @Column(name = "is_default", nullable = false)
     private boolean isDefault;

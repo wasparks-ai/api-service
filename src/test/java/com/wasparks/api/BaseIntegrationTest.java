@@ -121,8 +121,9 @@ public abstract class BaseIntegrationTest {
         // tests. CASCADE handles the FK web in one statement.
         jdbcTemplate.execute("""
                 TRUNCATE TABLE api_webhook_deliveries, api_outbox_events, api_webhook_endpoints,
-                               api_usage_daily, api_keys, tenant_api_plans, api_partner_tenants,
-                               whatsapp_accounts, tenant_users, tenants, api_partners, shedlock
+                               api_usage_daily, api_setup_links, api_keys, tenant_api_plans,
+                               api_partner_tenants, whatsapp_accounts, tenant_users, tenants,
+                               api_partners, shedlock
                 RESTART IDENTITY CASCADE
                 """);
         // Redis carries counters and cached principals between tests; a leftover rate-limit window or a
@@ -221,16 +222,91 @@ public abstract class BaseIntegrationTest {
                 tenantId, planId, overridesJson);
     }
 
-    /** Create a bespoke plan row, for the WARN-overage and tight-limit cases. */
+    /**
+     * Create or re-shape a bespoke plan row, for the WARN-overage and tight-limit cases.
+     *
+     * <p>An UPSERT, because {@code api_plans} is deliberately <b>not</b> truncated between tests — the
+     * seeded FREE plan is what a tenant with no assignment falls back to, and dropping it would change
+     * what half the suite is testing. Without the upsert, two test classes that happen to pick the same
+     * plan code collide on the unique index, and the failure reads as a duplicate key rather than as the
+     * naming clash it is.
+     */
     protected void createPlan(String code, int requestsPerMinute, int messagesPerDay,
                               int messagesPerMonth, String overagePolicy, int maxKeys) {
         jdbcTemplate.update("""
                         INSERT INTO api_plans (id, code, name, requests_per_minute, messages_per_day,
                                                messages_per_month, overage_policy, max_keys)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (code) DO UPDATE SET
+                            requests_per_minute = EXCLUDED.requests_per_minute,
+                            messages_per_day    = EXCLUDED.messages_per_day,
+                            messages_per_month  = EXCLUDED.messages_per_month,
+                            overage_policy      = EXCLUDED.overage_policy,
+                            max_keys            = EXCLUDED.max_keys
                         """,
                 UUID.randomUUID(), code, code, requestsPerMinute, messagesPerDay, messagesPerMonth,
                 overagePolicy, maxKeys);
+    }
+
+    // ------------------------------------------------------------------ partner fixtures (021)
+
+    /**
+     * Turn {@link #tenantId} into a partner, as admin-service would.
+     *
+     * <p>Written with SQL rather than through a repository because this service <b>never</b> writes
+     * {@code api_partners} — a test helper that could would be a helper testing something production
+     * cannot do. The same goes for the {@code api_partner_tenants} INSERT in {@link #addClient}: the row
+     * is admin-service's to create, and only its status and cap columns are ours.
+     */
+    protected UUID makePartner(String slug) {
+        UUID partnerId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                        INSERT INTO api_partners (id, name, slug, status, owner_tenant_id, branding,
+                                                  webhook_scope)
+                        VALUES (?, ?, ?, 'ACTIVE', ?, CAST(? AS jsonb), 'PARTNER')
+                        """,
+                partnerId, slug, slug, tenantId,
+                "{\"productName\":\"" + slug + "\",\"primaryColor\":\"#1A73E8\"}");
+        return partnerId;
+    }
+
+    /** Provision a client tenant for a partner and link it. Returns the client's tenant id. */
+    protected UUID addClient(UUID partnerId, String externalRef, Integer dailyCap) {
+        return addClient(partnerId, externalRef, dailyCap, "ACTIVE");
+    }
+
+    protected UUID addClient(UUID partnerId, String externalRef, Integer dailyCap, String status) {
+        UUID clientId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO tenants (id, company_name, contact_email, status) "
+                        + "VALUES (?, ?, ?, 'ACTIVE'::tenant_status)",
+                clientId, "Client " + externalRef, externalRef + "@clients.test.wasparks.invalid");
+        jdbcTemplate.update("""
+                        INSERT INTO api_partner_tenants (partner_id, tenant_id, external_ref,
+                                                         display_name, status, messages_per_day_cap,
+                                                         created_via)
+                        VALUES (?, ?, ?, ?, ?, ?, 'API')
+                        """,
+                partnerId, clientId, externalRef, "Client " + externalRef, status, dailyCap);
+        return clientId;
+    }
+
+    /** Issue a partner key for {@link #tenantId}'s partner row, returning the plaintext. */
+    protected String issuePartnerKey(UUID partnerId) {
+        return apiKeyService.issuePartnerKey(tenantId, partnerId, tenantUserId, "partner key",
+                ApiKeyMode.LIVE, null).plaintext();
+    }
+
+    /** Assign a plan to an arbitrary tenant — the partner pool plan lives on the owner tenant. */
+    protected void assignPlanTo(UUID targetTenantId, String planCode) {
+        UUID planId = jdbcTemplate.queryForObject(
+                "SELECT id FROM api_plans WHERE code = ?", UUID.class, planCode);
+        jdbcTemplate.update("""
+                        INSERT INTO tenant_api_plans (tenant_id, plan_id)
+                        VALUES (?, ?)
+                        ON CONFLICT (tenant_id) DO UPDATE SET plan_id = EXCLUDED.plan_id
+                        """,
+                targetTenantId, planId);
     }
 
     /** A tenant access token of the kind tenants-service issues, for the /v1/keys chain. */

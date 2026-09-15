@@ -69,12 +69,14 @@ class WebhookPipelineIntegrationTest extends BaseIntegrationTest {
 
     private EffectiveLimits generousLimits() {
         return new EffectiveLimits("TEST", 1000, 10000, 100000, 100, 10, 10,
-                com.wasparks.api.enums.OveragePolicy.BLOCK, false);
+                com.wasparks.api.enums.OveragePolicy.BLOCK, false,
+                com.wasparks.api.enums.BillingModel.FIXED, null, null, false);
     }
 
     private WebhookEndpointService.Created createEndpoint(List<String> events) {
         // localhost http is permitted precisely so a developer (and this test) can receive deliveries.
-        return endpointService.create(tenantId, tenantUserId, receiverUrl, events, generousLimits());
+        return endpointService.create(tenantId, null, tenantUserId, receiverUrl, events,
+                generousLimits());
     }
 
     private ApiOutboxEvent writeEvent(String type, Map<String, Object> payload) {

@@ -13,7 +13,11 @@
 --   * api_usage_daily.api_key_id is NOT NULL with the zero-UUID sentinel default (amendment 1). A test
 --     that wrote NULL there would pass against generated DDL and fail in production.
 --
--- The `messages` ALTER from 020 is deliberately absent: this service does not map messages (hand-off §2).
+-- The `messages` ALTER from 020/021 is deliberately absent: this service does not map messages
+-- (hand-off §2), so `media_object_key` and the recipient_status enum value have nothing to validate here.
+--
+-- 021_api_partners.sql is folded in rather than appended as ALTERs: this is a transcript of the shapes,
+-- not of the migration history, and the partner columns are marked with their 021 section.
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -49,6 +53,8 @@ CREATE TABLE tenants (
     address       TEXT,
     status        tenant_status NOT NULL DEFAULT 'ACTIVE',
     onboarded_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
+    -- 021 §8. Written by this service from the Partner console; read by the campaign engine.
+    min_days_between_marketing SMALLINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -77,7 +83,11 @@ CREATE TABLE whatsapp_accounts (
     -- Added by 020 §7 (token expiry becomes first-class).
     token_expires_at       TIMESTAMP WITH TIME ZONE,
     token_last_verified_at TIMESTAMP WITH TIME ZONE,
-    token_error_code       VARCHAR(16)
+    token_error_code       VARCHAR(16),
+    -- 021 §5. ES | DIRECT | MANUAL; NULL for a number connected before this epic.
+    mapped_via             VARCHAR(8),
+    CONSTRAINT chk_whatsapp_accounts_mapped_via
+        CHECK (mapped_via IS NULL OR mapped_via IN ('ES', 'DIRECT', 'MANUAL'))
 );
 
 -- ============================================================
@@ -96,11 +106,17 @@ CREATE TABLE api_plans (
     max_webhook_endpoints    INT NOT NULL DEFAULT 3,
     overage_policy           VARCHAR(8) NOT NULL DEFAULT 'BLOCK',
     sandbox_only             BOOLEAN NOT NULL DEFAULT false,
+    -- 021 §4
+    billing_model            VARCHAR(8) NOT NULL DEFAULT 'FIXED',
+    price_per_message_minor  BIGINT,
+    currency                 VARCHAR(3),
+    partner_plan             BOOLEAN NOT NULL DEFAULT false,
     is_default               BOOLEAN NOT NULL DEFAULT false,
     active                   BOOLEAN NOT NULL DEFAULT true,
     created_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_api_plans_overage CHECK (overage_policy IN ('BLOCK', 'WARN'))
+    CONSTRAINT chk_api_plans_overage CHECK (overage_policy IN ('BLOCK', 'WARN')),
+    CONSTRAINT chk_api_plans_billing_model CHECK (billing_model IN ('FIXED', 'METERED'))
 );
 CREATE UNIQUE INDEX uq_api_plans_default ON api_plans (is_default) WHERE is_default = true;
 CREATE TRIGGER update_api_plans_updated_at BEFORE UPDATE ON api_plans
@@ -119,6 +135,8 @@ CREATE TABLE tenant_api_plans (
 CREATE TRIGGER update_tenant_api_plans_updated_at BEFORE UPDATE ON tenant_api_plans
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+-- api_partners and api_partner_tenants are shown here with their 021 columns already folded in, rather
+-- than as 020 plus an ALTER. The file is a transcript of the shapes, not of the migration history.
 CREATE TABLE api_partners (
     id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name              VARCHAR(150) NOT NULL,
@@ -128,18 +146,36 @@ CREATE TABLE api_partners (
     billing_mode      VARCHAR(16)  NOT NULL DEFAULT 'CUSTOMER_MANAGED',
     meta_app_id       VARCHAR(64),
     meta_es_config_id VARCHAR(64),
+    -- 021 §1
+    owner_tenant_id   UUID NOT NULL REFERENCES tenants(id),
+    support_email     VARCHAR(255),
+    webhook_scope     VARCHAR(16)  NOT NULL DEFAULT 'PARTNER',
+    created_by        UUID REFERENCES admins(id),
     created_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_api_partners_webhook_scope CHECK (webhook_scope IN ('PARTNER', 'CLIENT'))
 );
+CREATE UNIQUE INDEX uq_api_partners_owner_tenant ON api_partners (owner_tenant_id);
 CREATE TRIGGER update_api_partners_updated_at BEFORE UPDATE ON api_partners
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TABLE api_partner_tenants (
-    partner_id UUID NOT NULL REFERENCES api_partners(id) ON DELETE CASCADE,
-    tenant_id  UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (partner_id, tenant_id)
+    partner_id           UUID NOT NULL REFERENCES api_partners(id) ON DELETE CASCADE,
+    tenant_id            UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    -- 021 §2
+    external_ref         VARCHAR(128),
+    display_name         VARCHAR(150) NOT NULL DEFAULT '',
+    status               VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    app_access           BOOLEAN      NOT NULL DEFAULT false,
+    messages_per_day_cap INT,
+    created_via          VARCHAR(8)   NOT NULL DEFAULT 'API',
+    created_at           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (partner_id, tenant_id),
+    CONSTRAINT chk_api_partner_tenants_status CHECK (status IN ('ACTIVE', 'SUSPENDED')),
+    CONSTRAINT chk_api_partner_tenants_created_via CHECK (created_via IN ('API', 'CONSOLE'))
 );
+CREATE UNIQUE INDEX uq_api_partner_tenants_external_ref
+    ON api_partner_tenants (partner_id, external_ref) WHERE external_ref IS NOT NULL;
 
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -167,6 +203,30 @@ CREATE INDEX idx_api_keys_ui_session ON api_keys (tenant_id, expires_at) WHERE u
 CREATE TRIGGER update_api_keys_updated_at BEFORE UPDATE ON api_keys
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+-- 021 §3. api-service only READS this table — tenants-service mints, completes and expires the rows —
+-- but ddl-auto=validate checks the mapping either way, and the caps/status tests read it back.
+CREATE TABLE api_setup_links (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    partner_id      UUID NOT NULL REFERENCES api_partners(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    token_hash      VARCHAR(64)   NOT NULL UNIQUE,
+    success_url     VARCHAR(2048) NOT NULL,
+    failure_url     VARCHAR(2048) NOT NULL,
+    status          VARCHAR(16)   NOT NULL DEFAULT 'PENDING',
+    expires_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '7 days'),
+    completed_at    TIMESTAMP WITH TIME ZONE,
+    phone_number_id VARCHAR(255),
+    waba_id         VARCHAR(255),
+    created_by_key  UUID REFERENCES api_keys(id) ON DELETE SET NULL,
+    created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_api_setup_links_status
+        CHECK (status IN ('PENDING', 'COMPLETED', 'EXPIRED', 'CANCELLED'))
+);
+CREATE INDEX idx_api_setup_links_tenant ON api_setup_links (tenant_id);
+CREATE TRIGGER update_api_setup_links_updated_at BEFORE UPDATE ON api_setup_links
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 CREATE TABLE api_webhook_endpoints (
     id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id            UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -176,6 +236,7 @@ CREATE TABLE api_webhook_endpoints (
     events               JSONB NOT NULL,
     status               VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
     consecutive_failures INT NOT NULL DEFAULT 0,
+    include_ui_sends     BOOLEAN NOT NULL DEFAULT false,   -- 021 §7, forced true on partner endpoints
     last_success_at      TIMESTAMP WITH TIME ZONE,
     last_failure_at      TIMESTAMP WITH TIME ZONE,
     created_by           UUID REFERENCES tenant_users(id) ON DELETE SET NULL,
@@ -242,3 +303,11 @@ INSERT INTO api_plans (code, name, requests_per_minute, messages_per_day, messag
     ('FREE',     'Free',       60,   200,    2000,    true),
     ('STARTER',  'Starter',    300,  5000,   100000,  false),
     ('BUSINESS', 'Business',   1000, 50000,  1000000, false);
+
+-- The 021 partner plans. PARTNER_METERED carries the amended seed price (amendment 13): admin-service
+-- refuses a METERED plan with no price or currency, and 021 originally seeded neither.
+INSERT INTO api_plans (code, name, requests_per_minute, messages_per_day, messages_per_month,
+                       billing_model, price_per_message_minor, currency, partner_plan,
+                       max_keys, max_webhook_endpoints) VALUES
+    ('PARTNER_STARTER', 'Partner Starter', 600,  20000,   400000,   'FIXED',   NULL, NULL,  true, 10, 10),
+    ('PARTNER_METERED', 'Partner Metered', 1000, 1000000, 30000000, 'METERED', 50,   'INR', true, 10, 10);

@@ -10,6 +10,7 @@ import com.wasparks.api.enums.WebhookEndpointStatus;
 import com.wasparks.api.error.ApiErrorCode;
 import com.wasparks.api.error.ApiException;
 import com.wasparks.api.webhook.WebhookEndpointService;
+import com.wasparks.api.webhook.WebhookEvents;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -92,12 +93,39 @@ public class WebhooksController {
     public ResponseEntity<Map<String, Object>> create(@Valid @RequestBody CreateRequest request) {
         ApiPrincipal principal = CurrentPrincipal.api();
         WebhookEndpointService.Created created = endpointService.create(
-                principal.tenantId(), null, request.getUrl(), request.getEvents(),
-                principal.limits());
+                principal.tenantId(), partnerScope(principal), null, request.getUrl(),
+                request.getEvents(), principal.limits());
 
         Map<String, Object> body = toPublic(created.endpoint());
         body.put("secret", created.secret());
         return ResponseEntity.status(HttpStatus.CREATED).body(body);
+    }
+
+    @GetMapping("/events")
+    @RequiredScope(Scope.WEBHOOKS_MANAGE)
+    @PreAuthorize("hasAuthority('SCOPE_webhooks:manage')")
+    @Operation(summary = "List subscribable events",
+            description = "Every event name you can put in `events`, plus the `*` glob — this is what "
+                    + "the event picker in WaSparks is built from.")
+    public Map<String, Object> events() {
+        return Map.of("events", WebhookEvents.SUBSCRIBABLE);
+    }
+
+    /**
+     * Whether this registration is a <b>partner</b> endpoint — one that receives events for every client
+     * — or an ordinary per-tenant one.
+     *
+     * <p>A partner key acting on its own tenant (no {@code X-Tenant-Id}) is registering for its whole
+     * estate, which is the shape §B5 describes. The same key acting on one client is registering for
+     * that client alone, and stamping {@code partner_id} there would quietly turn a per-client endpoint
+     * into a firehose of every other client's traffic. Per-client endpoints remain possible precisely
+     * because the header distinguishes the two.
+     */
+    private UUID partnerScope(ApiPrincipal principal) {
+        if (principal.isPartner() && principal.partner().actingOnOwnTenant()) {
+            return principal.partner().partnerId();
+        }
+        return null;
     }
 
     @GetMapping("/{id}")
@@ -178,6 +206,10 @@ public class WebhooksController {
         body.put("url", endpoint.getUrl());
         body.put("events", endpoint.getEvents());
         body.put("status", endpoint.getStatus().name());
+        // Reported so a partner can confirm it registered the partner-wide endpoint it meant to, rather
+        // than a per-client one it will wonder about later when half its traffic is missing.
+        body.put("scope", endpoint.getPartnerId() == null ? "TENANT" : "PARTNER");
+        body.put("includeUiSends", endpoint.isIncludeUiSends());
         body.put("consecutiveFailures", endpoint.getConsecutiveFailures());
         body.put("lastSuccessAt", endpoint.getLastSuccessAt());
         body.put("lastFailureAt", endpoint.getLastFailureAt());

@@ -63,6 +63,18 @@ public class ApiWebhookEndpoint {
     @Column(name = "status", nullable = false, length = 16)
     private WebhookEndpointStatus status;
 
+    /**
+     * Deliver this tenant's UI sends too, not only key-originated ones (021 §7, epic §0.7).
+     *
+     * <p>Default false, which is the P1 filter: an ordinary tenant's integration hears about the messages
+     * it sent, not about the ones its staff typed in our inbox. <b>Forced true on a partner endpoint</b>
+     * — a partner whose client has {@code app_access} on is the system of record for that
+     * conversation, and a message it cannot see is a gap in its own product rather than a courtesy.
+     */
+    @Column(name = "include_ui_sends", nullable = false)
+    @Builder.Default
+    private boolean includeUiSends = false;
+
     @Column(name = "consecutive_failures", nullable = false)
     @Builder.Default
     private Integer consecutiveFailures = 0;

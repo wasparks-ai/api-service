@@ -65,9 +65,23 @@ public class WebhookEndpointService {
                 .orElseThrow(() -> ApiException.of(ApiErrorCode.NOT_FOUND, "No such webhook endpoint."));
     }
 
+    /**
+     * Register an endpoint.
+     *
+     * <p>{@code partnerId} turns it into a <b>partner endpoint</b> (§B5): one registration that receives
+     * every event for every one of that partner's clients, rather than one per client. That is the shape
+     * both launch partners asked for — they hold one webhook handler and route on the {@code tenantId}
+     * in the payload — and a partner with two hundred clients registering two hundred endpoints would
+     * exhaust any sane plan limit anyway.
+     *
+     * <p>A partner endpoint always has {@code include_ui_sends} true (§0.7), because a partner is the
+     * system of record for its client's conversations and a message it cannot see is a gap in its own
+     * product. It is set here as well as derived at fan-out, so the column tells the truth to anyone
+     * reading the table.
+     */
     @Transactional
-    public Created create(UUID tenantId, UUID createdBy, String url, List<String> events,
-                          EffectiveLimits limits) {
+    public Created create(UUID tenantId, UUID partnerId, UUID createdBy, String url,
+                          List<String> events, EffectiveLimits limits) {
         requireDeliverableUrl(url);
         List<String> patterns = requireEvents(events);
 
@@ -83,10 +97,12 @@ public class WebhookEndpointService {
         ApiWebhookEndpoint endpoint = ApiWebhookEndpoint.builder()
                 .id(Uuid7.generate())
                 .tenantId(tenantId)
+                .partnerId(partnerId)
                 .url(url.trim())
                 .secretEncrypted(encryptionUtil.encrypt(secret))
                 .events(patterns)
                 .status(WebhookEndpointStatus.ACTIVE)
+                .includeUiSends(partnerId != null)
                 .consecutiveFailures(0)
                 .createdBy(createdBy)
                 .build();

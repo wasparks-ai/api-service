@@ -44,7 +44,11 @@ class KeysApiIntegrationTest extends BaseIntegrationTest {
                 .andExpect(jsonPath("$.key").exists())
                 .andExpect(jsonPath("$.mode").value("LIVE"))
                 .andExpect(jsonPath("$.status").value("ACTIVE"))
-                .andExpect(jsonPath("$.scopes.length()").value(6))
+                // Every scope, whatever the vocabulary currently is — it grew with the partner
+                // platform (customers, campaigns, media), and pinning a number here would mean this
+                // test failing every time a scope is added rather than when the default changes.
+                .andExpect(jsonPath("$.scopes.length()")
+                        .value(com.wasparks.api.enums.Scope.values().length))
                 .andReturn();
 
         String plaintext = objectMapper.readTree(result.getResponse().getContentAsString())

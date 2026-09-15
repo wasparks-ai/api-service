@@ -6,6 +6,7 @@ import com.wasparks.api.auth.TenantJwtAuthFilter;
 import com.wasparks.api.error.ApiErrorCode;
 import com.wasparks.api.error.ApiErrorWriter;
 import com.wasparks.api.error.ApiException;
+import com.wasparks.api.partner.PartnerTenantResolver;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -54,15 +55,22 @@ public class SecurityConfig {
             "/swagger-ui.html", "/swagger-ui/**"
     };
 
-    /** The JWT chain's territory, and nothing beyond it. */
-    public static final String KEYS_PATTERN = "/v1/keys/**";
+    /**
+     * The JWT chain's territory, and nothing beyond it.
+     *
+     * <p>Two groups, for the same bootstrap reason. {@code /v1/keys/**} is where a tenant's first key
+     * comes from. {@code /v1/partner/**} is the Partner console backend (api-partner epic §B6): the
+     * partner is signed into tenant-web, and asking it to hold a partner key in the browser in order to
+     * manage its partner keys would put the estate's most powerful credential in an XSS payload.
+     */
+    public static final String[] JWT_PATTERNS = {"/v1/keys/**", "/v1/partner/**"};
 
     /** The prefix CORS is enabled for. {@code /meta/**} stays CORS-disabled: no browser calls it. */
     public static final String CORS_PATTERN = "/v1/**";
 
     @Bean
     @Order(1)
-    public SecurityFilterChain keyManagementChain(HttpSecurity http, ApiErrorWriter errorWriter,
+    public SecurityFilterChain tenantSessionChain(HttpSecurity http, ApiErrorWriter errorWriter,
                                                   CorsConfigurationSource corsConfigurationSource,
                                                   @Value("${app.jwt.secret}") String jwtSecret,
                                                   @Value("${app.jwt.issuer}") String jwtIssuer)
@@ -70,7 +78,7 @@ public class SecurityConfig {
         TenantJwtAuthFilter jwtFilter = new TenantJwtAuthFilter(errorWriter, jwtSecret, jwtIssuer);
         jwtFilter.init();
 
-        http.securityMatcher(KEYS_PATTERN)
+        http.securityMatcher(JWT_PATTERNS)
                 .csrf(AbstractHttpConfigurer::disable)
                 .cors(cors -> cors.configurationSource(corsConfigurationSource))
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -94,6 +102,7 @@ public class SecurityConfig {
     @Bean
     @Order(2)
     public SecurityFilterChain apiKeyChain(HttpSecurity http, ApiKeyService apiKeyService,
+                                           PartnerTenantResolver partnerTenantResolver,
                                            ApiErrorWriter errorWriter,
                                            CorsConfigurationSource corsConfigurationSource) throws Exception {
         http.csrf(AbstractHttpConfigurer::disable)
@@ -104,7 +113,8 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(PUBLIC_PATHS).permitAll()
                         .anyRequest().authenticated())
-                .addFilterBefore(new ApiKeyAuthFilter(apiKeyService, errorWriter),
+                .addFilterBefore(new ApiKeyAuthFilter(apiKeyService, partnerTenantResolver,
+                                errorWriter),
                         AnonymousAuthenticationFilter.class)
                 .exceptionHandling(e -> e
                         .authenticationEntryPoint(entryPoint(errorWriter))
@@ -126,7 +136,8 @@ public class SecurityConfig {
         configuration.setAllowedOrigins(Arrays.asList(allowedOrigins.split(",")));
         configuration.setAllowedMethods(List.of("GET", "POST", "PATCH", "DELETE"));
         configuration.setAllowedHeaders(
-                List.of("Authorization", "X-API-Key", "Content-Type", "Idempotency-Key"));
+                List.of("Authorization", "X-API-Key", "X-Tenant-Id", "Content-Type",
+                        "Idempotency-Key"));
         configuration.setExposedHeaders(List.of(
                 "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"));
         configuration.setMaxAge(3600L);

@@ -1,24 +1,34 @@
 package com.wasparks.api.internal;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.NullNode;
 import com.wasparks.api.auth.ApiPrincipal;
 import io.netty.channel.ChannelOption;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.InputStreamResource;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.MultipartBodyBuilder;
 import org.springframework.stereotype.Component;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.util.UriBuilder;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 
+import java.io.InputStream;
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -52,6 +62,20 @@ public class InternalTenantsClient {
     public static final String HEADER_INTERNAL_TOKEN = "X-Internal-Token";
     public static final String HEADER_TENANT_ID = "X-Tenant-Id";
     public static final String HEADER_ACTOR_API_KEY = "X-Actor-Api-Key";
+
+    /** A CSV has to reach GCS before upstream answers, so it gets its own, longer ceiling (§B3). */
+    private static final Duration UPLOAD_TIMEOUT = Duration.ofSeconds(60);
+
+    /**
+     * The house error envelope's own keys — everything else in the body is a detail (amendment 6).
+     *
+     * <p>{@code status} is <b>not</b> among them, and deliberately so: the envelope's {@code status} is
+     * the numeric HTTP code, while {@code 410 link_unusable} uses a <em>string</em> {@code status} to say
+     * whether a setup link expired, was completed or was cancelled (setup-links.md) — which is the one
+     * thing the caller actually needs. {@link #isEnvelopeKey} separates them by type rather than by name.
+     */
+    private static final Set<String> ENVELOPE_KEYS =
+            Set.of("timestamp", "error", "code", "message", "path", "fieldErrors");
 
     private final String baseUrl;
     private final String internalSecret;
@@ -165,6 +189,212 @@ public class InternalTenantsClient {
                 principal.tenantId(), principal.keyId(), null, Void.class);
     }
 
+    // ------------------------------------------------------------------ campaigns (api-partner §C1)
+
+    /**
+     * Campaigns, audiences and uploads pass {@link JsonNode} through, for the same reason templates do:
+     * these are upstream's DTOs, this service adds only scope checks, the inline cap, quota reservation
+     * and a {@code clientRef} echo, and re-declaring the bodies here would be a second copy of the
+     * campaign engine's surface to keep in step for no benefit to anyone.
+     *
+     * <p>The one shape this service does read out of a response is {@code counts}, because the daily
+     * quota reservation is computed from it (§B3).
+     */
+    public JsonNode createCampaign(ApiPrincipal principal, JsonNode body) {
+        return exchange(HttpMethod.POST, uri -> uri.path("/internal/v1/campaigns").build(),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    public JsonNode listCampaigns(UUID tenantId, UUID apiKeyId, MultiValueMap<String, String> query) {
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/campaigns").queryParams(query).build(),
+                tenantId, apiKeyId, null, JsonNode.class);
+    }
+
+    public JsonNode getCampaign(UUID tenantId, UUID apiKeyId, String id) {
+        return exchange(HttpMethod.GET, uri -> uri.path("/internal/v1/campaigns/{id}").build(id),
+                tenantId, apiKeyId, null, JsonNode.class);
+    }
+
+    public JsonNode campaignRecipients(ApiPrincipal principal, String id,
+                                       MultiValueMap<String, String> query) {
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/campaigns/{id}/recipients").queryParams(query).build(id),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    public JsonNode appendCampaignRecipients(ApiPrincipal principal, String id, JsonNode body) {
+        return exchange(HttpMethod.POST,
+                uri -> uri.path("/internal/v1/campaigns/{id}/recipients").build(id),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    /**
+     * {@code start} | {@code pause} | {@code resume} | {@code cancel} — the names upstream uses.
+     *
+     * <p>Takes ids rather than a principal because the scheduled-campaign quota poller (§B3) calls it
+     * with no request in flight: it watches SCHEDULED campaigns across every client of every partner and
+     * has a tenant and a key id but no principal to speak of.
+     */
+    public JsonNode transitionCampaign(UUID tenantId, UUID apiKeyId, String id, String transition) {
+        return exchange(HttpMethod.POST,
+                uri -> uri.path("/internal/v1/campaigns/{id}/{transition}").build(id, transition),
+                tenantId, apiKeyId, null, JsonNode.class);
+    }
+
+    // ------------------------------------------------------------------ audiences (api-partner §B3a)
+
+    public JsonNode createAudience(ApiPrincipal principal, JsonNode body) {
+        return exchange(HttpMethod.POST, uri -> uri.path("/internal/v1/audiences").build(),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    public JsonNode listAudiences(ApiPrincipal principal, MultiValueMap<String, String> query) {
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/audiences").queryParams(query).build(),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    public JsonNode getAudience(ApiPrincipal principal, String id) {
+        return exchange(HttpMethod.GET, uri -> uri.path("/internal/v1/audiences/{id}").build(id),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    public JsonNode audienceMembers(ApiPrincipal principal, String id,
+                                    MultiValueMap<String, String> query) {
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/audiences/{id}/members").queryParams(query).build(id),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    public JsonNode addAudienceMembers(ApiPrincipal principal, String id, JsonNode body) {
+        return exchange(HttpMethod.POST,
+                uri -> uri.path("/internal/v1/audiences/{id}/members").build(id),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    /**
+     * Member removal carries a body on a DELETE, which is unusual but is upstream's contract and the
+     * honest shape: the alternative puts a customer's phone number in a query string, and a phone number
+     * does not belong in an access log.
+     */
+    public JsonNode removeAudienceMembers(ApiPrincipal principal, String id, JsonNode body) {
+        return exchange(HttpMethod.DELETE,
+                uri -> uri.path("/internal/v1/audiences/{id}/members").build(id),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    public void deleteAudience(ApiPrincipal principal, String id) {
+        exchange(HttpMethod.DELETE, uri -> uri.path("/internal/v1/audiences/{id}").build(id),
+                principal.tenantId(), principal.keyId(), null, Void.class);
+    }
+
+    // ------------------------------------------------------------------ CSV upload (api-partner §B3)
+
+    /**
+     * Stream a recipient CSV through to {@code POST /internal/v1/uploads/csv}, which stores it in GCS and
+     * returns {@code {uploadId, rows, columns, fileName}}.
+     *
+     * <p><b>Streamed, never buffered.</b> The part is wrapped as an {@link InputStreamResource} over the
+     * servlet container's own spooled file, so a 10 MB list of recipients travels from the socket to GCS
+     * without a copy of it existing on this service's heap. Reading it into a {@code byte[]} first would
+     * be a megabyte of garbage per upload and, with a few partners bulk-loading at once, the thing that
+     * pushes an otherwise idle gateway into a full GC.
+     *
+     * <p>The JSON content type every other call defaults to is overridden here; the multipart boundary is
+     * generated by the encoder.
+     */
+    public JsonNode uploadCsv(ApiPrincipal principal, String fileName, long size,
+                              InputStream content) {
+        MultipartBodyBuilder parts = new MultipartBodyBuilder();
+        parts.part("file", new InputStreamResource(content) {
+                    @Override
+                    public String getFilename() {
+                        return fileName;
+                    }
+
+                    /**
+                     * Known length, so the encoder can send a {@code Content-Length} rather than
+                     * chunking. {@code InputStreamResource} answers "unknown" by default, and upstream's
+                     * size check reads better against a declared length than against a stream that turns
+                     * out to be too long halfway through.
+                     */
+                    @Override
+                    public long contentLength() {
+                        return size;
+                    }
+                })
+                .contentType(MediaType.TEXT_PLAIN);
+
+        return exchangeMultipart(principal.tenantId(), principal.keyId(), parts.build());
+    }
+
+    // ------------------------------------------------------------------ setup links (api-partner §C3)
+
+    /**
+     * Mint a setup link. <b>The only call whose body carries a tenant id</b>, and the only one where the
+     * body and the {@code X-Tenant-Id} header disagree on purpose: the link is for the partner's
+     * CUSTOMER, while the header stays the acting tenant so the audit row names the right actor.
+     * api-service has already proved the customer belongs to the partner (§0.4); upstream does not map
+     * {@code api_partner_tenants} and deliberately does not re-derive it.
+     *
+     * <p>The response carries the 32-character token <b>once</b>. It is turned into a URL and never
+     * stored, logged or returned again.
+     */
+    public JsonNode createSetupLink(ApiPrincipal principal, JsonNode body) {
+        return exchange(HttpMethod.POST, uri -> uri.path("/internal/v1/setup-links").build(),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    public JsonNode getSetupLink(ApiPrincipal principal, String id) {
+        return exchange(HttpMethod.GET, uri -> uri.path("/internal/v1/setup-links/{id}").build(id),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    public JsonNode cancelSetupLink(ApiPrincipal principal, String id) {
+        return exchange(HttpMethod.POST,
+                uri -> uri.path("/internal/v1/setup-links/{id}/cancel").build(id),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    // ------------------------------------------------------------------ direct mapping + media
+
+    /**
+     * Direct number mapping (§0.5 / §C2). Three Graph calls happen upstream before a row is written; this
+     * service contributes the ownership check on the customer and the error pass-through, nothing else.
+     *
+     * <p>The body carries a Meta access token. It is never logged here — not at debug level, not in a
+     * failure message — and is encrypted the moment it reaches tenants-service.
+     */
+    public JsonNode mapAccount(ApiPrincipal principal, JsonNode body) {
+        return exchange(HttpMethod.POST, uri -> uri.path("/internal/v1/accounts/map").build(),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    /** A fresh 1-hour signed URL for an inbound message's stored media (§0.11). */
+    public JsonNode mediaUrl(ApiPrincipal principal, String messageId) {
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/media/{id}/url").build(messageId),
+                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+    }
+
+    // ------------------------------------------------------------------ tenant settings
+
+    /**
+     * Write a tenant setting the Partner console owns — today only the marketing frequency guard
+     * ({@code tenants.min_days_between_marketing}, 021 §8).
+     *
+     * <p><b>This endpoint is not in internal.md yet.</b> The hand-off anticipated that and says to request
+     * it; it is implemented here against the agreed path so the console works the moment tenants-service
+     * ships it, and a 404 from upstream surfaces as a plain "not available yet" rather than as a
+     * confusing generic failure. See the hand-off report §9.
+     */
+    public JsonNode updateTenantSettings(ApiPrincipal principal, Object body) {
+        return exchange(HttpMethod.PATCH,
+                uri -> uri.path("/internal/v1/tenants/{id}/settings").build(principal.tenantId()),
+                principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
     // ------------------------------------------------------------------ account
 
     public InternalDtos.AccountResponse getAccount(ApiPrincipal principal) {
@@ -173,6 +403,46 @@ public class InternalTenantsClient {
     }
 
     // ------------------------------------------------------------------ plumbing
+
+    /**
+     * The multipart variant of {@link #exchange}. Separate rather than a flag on it because the two
+     * differ in three places at once — content type, body encoding and the absence of a retryable body —
+     * and a shared method with three branches would be harder to read than the duplication is to keep.
+     */
+    private JsonNode exchangeMultipart(UUID tenantId, UUID apiKeyId,
+                                       MultiValueMap<String, HttpEntity<?>> parts) {
+        try {
+            return webClient.post()
+                    .uri(uri -> uri.path("/internal/v1/uploads/csv").build())
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .header(HEADER_TENANT_ID, tenantId.toString())
+                    .header(HEADER_ACTOR_API_KEY, apiKeyId == null ? "" : apiKeyId.toString())
+                    .body(BodyInserters.fromMultipartData(parts))
+                    .retrieve()
+                    .onStatus(HttpStatusCode::is4xxClientError, response ->
+                            response.bodyToMono(JsonNode.class)
+                                    .defaultIfEmpty(NullNode.getInstance())
+                                    .flatMap(json -> Mono.error(toRejection(json,
+                                            response.statusCode().value()))))
+                    .onStatus(HttpStatusCode::is5xxServerError, response ->
+                            Mono.error(new UpstreamUnavailableException(
+                                    "tenants-service returned " + response.statusCode().value()
+                                            + " for a CSV upload")))
+                    .bodyToMono(JsonNode.class)
+                    // An upload is the one call that can legitimately outlast the standard timeout: the
+                    // bytes have to reach GCS before upstream answers. A minute is generous for 10 MB
+                    // and still bounded, so a stalled upload cannot pin a request thread indefinitely.
+                    .block(UPLOAD_TIMEOUT);
+        } catch (UpstreamRejectedException | UpstreamUnavailableException e) {
+            throw e;
+        } catch (WebClientRequestException e) {
+            throw new UpstreamUnavailableException(
+                    "Could not reach tenants-service at " + baseUrl + ": " + e.getMessage(), e);
+        } catch (Exception e) {
+            throw new UpstreamUnavailableException("CSV upload to tenants-service failed: "
+                    + e.getMessage(), e);
+        }
+    }
 
     private <T> T exchange(HttpMethod method,
                            Function<UriBuilder, java.net.URI> uriFunction,
@@ -225,6 +495,7 @@ public class InternalTenantsClient {
         String message = body != null && body.hasNonNull("message")
                 ? body.get("message").asText()
                 : "tenants-service rejected the request with HTTP " + status;
+        Map<String, Object> details = extraKeys(body);
         if (code == null) {
             code = switch (status) {
                 case 404 -> "not_found";
@@ -234,7 +505,36 @@ public class InternalTenantsClient {
                 default -> "invalid_request";
             };
         }
-        return new UpstreamRejectedException(code, message, status);
+        return new UpstreamRejectedException(code, message, status, details);
+    }
+
+    /**
+     * Upstream's error {@code details} arrive as top-level keys beside {@code code} and {@code message}
+     * (amendment 6) — {@code docsUrl} on a 422, {@code status} on a 410. Everything that is not part of
+     * the envelope itself is one of those, so the envelope's own keys are named and the rest is taken.
+     * Naming what to <em>drop</em> rather than what to keep means a detail tenants-service adds later
+     * reaches the partner without a change here.
+     */
+    private Map<String, Object> extraKeys(JsonNode body) {
+        if (body == null || !body.isObject()) {
+            return Map.of();
+        }
+        Map<String, Object> extras = new LinkedHashMap<>();
+        body.fields().forEachRemaining(entry -> {
+            if (isEnvelopeKey(entry.getKey(), entry.getValue()) || entry.getValue().isNull()) {
+                return;
+            }
+            JsonNode value = entry.getValue();
+            extras.put(entry.getKey(), value.isValueNode()
+                    ? (value.isNumber() ? value.numberValue() : value.asText())
+                    : value);
+        });
+        return extras;
+    }
+
+    /** A numeric {@code status} is the HTTP code; a string one is the setup link's own state. */
+    private boolean isEnvelopeKey(String name, JsonNode value) {
+        return ENVELOPE_KEYS.contains(name) || ("status".equals(name) && value.isNumber());
     }
 
     private String trim(String text) {
