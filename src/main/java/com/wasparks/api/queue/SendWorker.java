@@ -253,7 +253,7 @@ public class SendWorker {
 
         // The message never left, so the tenant must not be charged for it (epic §B3). Only a
         // synchronous refusal releases quota — a Meta-side failure means the send did happen.
-        quotaService.release(job.tenantId());
+        quotaService.release(job.tenantId(), job.partner(), 1);
     }
 
     /**

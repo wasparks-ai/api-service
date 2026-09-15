@@ -1,6 +1,7 @@
 package com.wasparks.api.v1;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.CurrentPrincipal;
 import com.wasparks.api.auth.RequiredScope;
@@ -52,25 +53,35 @@ public class TemplatesController {
     private final InternalTenantsClient tenantsClient;
     private final TemplateCreateLimiter templateCreateLimiter;
     private final UsageService usageService;
+    private final ObjectMapper objectMapper;
 
     @GetMapping
     @RequiredScope(Scope.TEMPLATES_READ)
     @PreAuthorize("hasAuthority('SCOPE_templates:read')")
     @Operation(summary = "List templates",
-            description = "Filter by `status` (DRAFT, PENDING, APPROVED, REJECTED, PAUSED) and "
-                    + "`category`. Paged with `page` and `size`.")
-    public JsonNode list(@RequestParam(required = false) String status,
-                         @RequestParam(required = false) String category,
-                         @RequestParam(required = false) Integer page,
-                         @RequestParam(required = false) Integer size) {
+            description = """
+                    Filter by `status` (DRAFT, PENDING, APPROVED, REJECTED, PAUSED) and `category`.
+
+                    **Changed on 2026-09-16.** This returns `{"data":[…],"meta":{"next_cursor"}}` like
+                    every other list on this API, and pages with `cursor` and `limit`. It previously
+                    returned the underlying `{"content":[…],"totalElements":…}` and took `page` and
+                    `size` — if you are reading `content`, read `data`, and walk with `meta.next_cursor`
+                    instead of incrementing a page number.""")
+    public PagedResponse<Object> list(@RequestParam(required = false) String status,
+                                      @RequestParam(required = false) String category,
+                                      @RequestParam(required = false) String cursor,
+                                      @RequestParam(required = false) Integer limit) {
         ApiPrincipal principal = CurrentPrincipal.api();
+        int size = PagedResponse.clampLimit(limit);
+        int page = UpstreamPages.decodeCursor(cursor);
+
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
         addIfPresent(query, "status", status);
         addIfPresent(query, "category", category);
-        addIfPresent(query, "page", page == null ? null : String.valueOf(page));
-        addIfPresent(query, "size", size == null ? null
-                : String.valueOf(PagedResponse.clampLimit(size)));
-        return proxy(() -> tenantsClient.listTemplates(principal, query));
+        UpstreamPages.pageParams(page, size).forEach(query::add);
+
+        JsonNode upstream = proxy(() -> tenantsClient.listTemplates(principal, query));
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     @GetMapping("/{id}")

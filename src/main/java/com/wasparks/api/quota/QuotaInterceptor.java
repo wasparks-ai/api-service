@@ -84,7 +84,7 @@ public class QuotaInterceptor implements HandlerInterceptor {
                     UsageService.FIELD_MESSAGES_ACCEPTED);
         } else {
             // The send was reserved but never accepted — give the slot back.
-            quotaService.release(principal.tenantId());
+            quotaService.release(principal, 1);
         }
     }
 

@@ -59,21 +59,29 @@ public class RedisConfig {
      * under any plan it is a limit that does not actually hold. The script increments first and rolls
      * back with a DECR when it overshot, so the decision and the mutation cannot be separated.
      *
-     * <p>{@code KEYS[1]} counter, {@code ARGV[1]} limit, {@code ARGV[2]} TTL seconds. Returns the new
-     * count when the reservation succeeded, or {@code -1} when it was refused — the caller needs to tell
-     * "you are at 5 of 5" from "refused", and a bare boolean cannot carry the count for the header.
+     * <p>{@code KEYS[1]} counter, {@code ARGV[1]} limit, {@code ARGV[2]} TTL seconds, {@code ARGV[3]} how
+     * many to reserve. Returns the new count when the reservation succeeded, or {@code -1} when it was
+     * refused — the caller needs to tell "you are at 5 of 5" from "refused", and a bare boolean cannot
+     * carry the count for the header.
+     *
+     * <p>The amount is a parameter because a campaign reserves its whole recipient list in one move
+     * (api-partner epic §B3). Reserving 4,000 messages as 4,000 round trips would be slow and, worse,
+     * would not be atomic: a campaign could take half the day's remaining quota, be refused the other
+     * half, and leave the tenant unable to send anything else for a campaign that never started. One
+     * INCRBY either fits or does not.
      */
     @Bean
     public RedisScript<Long> reserveQuotaScript() {
         String lua = """
                 local limit = tonumber(ARGV[1])
                 local ttl = tonumber(ARGV[2])
-                local current = redis.call('INCR', KEYS[1])
-                if current == 1 then
+                local amount = tonumber(ARGV[3])
+                local current = redis.call('INCRBY', KEYS[1], amount)
+                if current == amount then
                   redis.call('EXPIRE', KEYS[1], ttl)
                 end
                 if limit >= 0 and current > limit then
-                  redis.call('DECR', KEYS[1])
+                  redis.call('DECRBY', KEYS[1], amount)
                   return -1
                 end
                 return current

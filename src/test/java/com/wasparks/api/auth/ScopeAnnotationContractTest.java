@@ -2,9 +2,14 @@ package com.wasparks.api.auth;
 
 import com.wasparks.api.meta.MetaMessagesController;
 import com.wasparks.api.v1.AccountController;
+import com.wasparks.api.v1.AudiencesController;
+import com.wasparks.api.v1.CampaignsController;
+import com.wasparks.api.v1.CustomersController;
 import com.wasparks.api.v1.KeysController;
+import com.wasparks.api.v1.MediaController;
 import com.wasparks.api.v1.MessagesController;
 import com.wasparks.api.v1.TemplatesController;
+import com.wasparks.api.v1.UploadsController;
 import com.wasparks.api.v1.WebhooksController;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -41,7 +46,15 @@ class ScopeAnnotationContractTest {
             MessagesController.class,
             TemplatesController.class,
             AccountController.class,
-            WebhooksController.class);
+            WebhooksController.class,
+            // The partner platform's own key-authenticated surface. These were not covered when they
+            // were added, which is its own small version of the same lesson: a contract test only
+            // covers what it is told about.
+            CustomersController.class,
+            CampaignsController.class,
+            AudiencesController.class,
+            UploadsController.class,
+            MediaController.class);
 
     @Test
     @DisplayName("every key-authenticated handler carries both annotations, agreeing on the scope")

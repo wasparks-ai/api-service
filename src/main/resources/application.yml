@@ -41,6 +41,17 @@ spring:
           max-idle: 8
           min-idle: 2
 
+  # Recipient CSVs (api-partner epic §B3) are streamed straight through to tenants-service, never read
+  # into heap. The 10 MB cap is this service's own; upstream applies its own `app.documents.max-size`
+  # (16 MB) as well, and the smaller of the two is what a partner actually gets.
+  servlet:
+    multipart:
+      max-file-size: ${API_MAX_CSV_SIZE:10MB}
+      max-request-size: ${API_MAX_CSV_SIZE:10MB}
+      # Spool to disk almost immediately: a multipart this service only forwards has no business
+      # occupying heap while it does so.
+      file-size-threshold: 64KB
+
   jackson:
     serialization:
       write-dates-as-timestamps: false
@@ -117,6 +128,34 @@ app:
     base-url: ${TENANTS_SERVICE_BASE_URL:http://localhost:8081}
     secret: ${INTERNAL_API_SECRET:ef82f6cb4031c4fae5744f1810686bf56c9340bc53e9f91d33d56cb7d984049b}
     timeout-ms: ${INTERNAL_TIMEOUT_MS:10000}
+
+  # The SECOND internal upstream (api-partner epic §B7): admin-service creates a partner's client
+  # tenants and answers the "is this tenant a partner?" resolve. Same INTERNAL_API_SECRET, same header
+  # scheme — but X-Tenant-Id is OPTIONAL there (amendment 12), because the surface is addressed by
+  # partner id and a partner creating its first client has no client tenant to name.
+  # Dev 8080; in compose http://admin-service:8080. nginx must 404 /internal/ on admin-api.wasparks.com.
+  admin:
+    base-url: ${ADMIN_SERVICE_BASE_URL:http://localhost:8080}
+
+  # The partner platform (api-partner epic §B1, §B2).
+  partner:
+    # The partner -> {client tenant: daily cap} hash behind every X-Tenant-Id resolution. 60s is the
+    # epic's number; the cache is invalidated eagerly on create/suspend/cap change, so this only bounds
+    # a row changed out of band by admin-service.
+    tenant-cache-ttl-seconds: ${API_PARTNER_CACHE_TTL_SECONDS:60}
+    # Where a hosted setup link points. tenant-web serves /setup/{token} (epic §E1); this service only
+    # builds the URL, because the token is minted by tenants-service and handed back exactly once.
+    app-base-url: ${APP_PUBLIC_BASE_URL:http://localhost:5173}
+    # Inline recipients per campaign or audience request (§B3 open fork: 5,000 is the default).
+    max-inline-recipients: ${API_MAX_INLINE_RECIPIENTS:5000}
+    # Default setup-link lifetime when the partner does not ask for one. Matches tenants-service's own
+    # app.setup-links.default-ttl-days; it validates, we only propose.
+    setup-link-ttl-hours: ${API_SETUP_LINK_TTL_HOURS:168}
+    # Watches SCHEDULED campaigns and reserves their quota shortly before they start (§B3). A campaign
+    # created today for next Tuesday cannot have reserved Tuesday's allowance at create time.
+    scheduled-quota:
+      poll-ms: ${API_SCHEDULED_QUOTA_POLL_MS:60000}
+      lookahead-minutes: ${API_SCHEDULED_QUOTA_LOOKAHEAD_MINUTES:5}
 
   api:
     # Resolved API keys are cached by sha256 hash so a hot key is one Redis GET, not a DB hit.

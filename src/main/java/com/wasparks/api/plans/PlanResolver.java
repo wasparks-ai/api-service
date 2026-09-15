@@ -2,6 +2,7 @@ package com.wasparks.api.plans;
 
 import com.wasparks.api.entity.ApiPlan;
 import com.wasparks.api.entity.TenantApiPlan;
+import com.wasparks.api.enums.BillingModel;
 import com.wasparks.api.enums.OveragePolicy;
 import com.wasparks.api.repository.ApiPlanRepository;
 import com.wasparks.api.repository.TenantApiPlanRepository;
@@ -34,6 +35,29 @@ public class PlanResolver {
 
     private final TenantApiPlanRepository tenantApiPlanRepository;
     private final ApiPlanRepository apiPlanRepository;
+
+    /**
+     * The limits a tenant has been <b>explicitly assigned</b>, or empty when it is only riding the
+     * default plan.
+     *
+     * <p>{@link #resolve} cannot answer this: it falls back to the {@code is_default} plan, so a tenant
+     * assigned FREE and a tenant assigned nothing come back identical. The difference matters for a
+     * partner's client (api-partner epic §B1) — a client with no assignment draws on its partner's pool,
+     * while one an admin has deliberately put on a plan keeps that plan and its own counters. Answering
+     * that from {@code planCode} would have made "FREE" mean two different things.
+     */
+    @Transactional(readOnly = true)
+    public Optional<EffectiveLimits> resolveExplicit(UUID tenantId) {
+        Optional<TenantApiPlan> assignment = tenantApiPlanRepository.findInForce(tenantId);
+        return assignment
+                .flatMap(a -> apiPlanRepository.findById(a.getPlanId()))
+                .filter(ApiPlan::isActive)
+                .map(plan -> {
+                    Map<String, Object> overrides = assignment.map(TenantApiPlan::getOverrides)
+                            .orElse(Map.of());
+                    return apply(plan, overrides == null ? Map.of() : overrides);
+                });
+    }
 
     @Transactional(readOnly = true)
     public EffectiveLimits resolve(UUID tenantId) {
@@ -71,7 +95,14 @@ public class PlanResolver {
                 intOr(overrides, "maxKeys", plan.getMaxKeys()),
                 intOr(overrides, "maxWebhookEndpoints", plan.getMaxWebhookEndpoints()),
                 policyOr(overrides, plan.getOveragePolicy()),
-                boolOr(overrides, "sandboxOnly", plan.isSandboxOnly()));
+                boolOr(overrides, "sandboxOnly", plan.isSandboxOnly()),
+                // Billing is not overridable. A per-tenant override that flipped FIXED to METERED would
+                // change what the tenant is invoiced for from a JSON blob nobody reviews; the plan row
+                // admin-webapp edits is the only place that decision is made (§0.9).
+                plan.getBillingModel() == null ? BillingModel.FIXED : plan.getBillingModel(),
+                plan.getPricePerMessageMinor(),
+                plan.getCurrency(),
+                plan.isPartnerPlan());
     }
 
     private int intOr(Map<String, Object> overrides, String key, Integer planValue) {

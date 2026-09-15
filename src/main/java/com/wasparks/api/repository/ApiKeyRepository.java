@@ -28,6 +28,32 @@ public interface ApiKeyRepository extends JpaRepository<ApiKey, UUID> {
     Optional<ApiKey> findByIdAndTenantId(UUID id, UUID tenantId);
 
     /**
+     * One tenant, one usable key id — the sweep list for {@code ScheduledCampaignQuotaJob} (api-partner
+     * epic §B3).
+     *
+     * <p>Two things come out of one query on purpose. Only a tenant holding an API key can have an API
+     * campaign, so this <em>is</em> the set of tenants worth sweeping; and the internal chain requires
+     * {@code X-Actor-Api-Key} to be a real {@code api_keys} id, so the sweep needs a key to call as. The
+     * key is arbitrary (the smallest id, for stability between ticks) because the job never acts as it —
+     * it only reads, and the audit trail records that a key belonging to the tenant did the reading.
+     *
+     * <p>UI-session keys are excluded: they expire hourly, and a sweep list that churned every hour would
+     * be a different list every time for no reason.
+     */
+    @Query("SELECT k.tenantId AS tenantId, MIN(k.id) AS apiKeyId FROM ApiKey k "
+            + "WHERE k.status = com.wasparks.api.enums.ApiKeyStatus.ACTIVE AND k.uiSession = false "
+            + "GROUP BY k.tenantId")
+    List<TenantKeyRef> findActiveTenantKeys();
+
+    /** A tenant and one of its usable key ids. */
+    interface TenantKeyRef {
+
+        UUID getTenantId();
+
+        UUID getApiKeyId();
+    }
+
+    /**
      * Counts against the plan's {@code max_keys}. Revoked keys do not occupy a slot, and neither do
      * UI-session keys — a tenant on the 3-key FREE plan must not be locked out of their own dashboard
      * by having opened it three times.

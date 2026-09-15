@@ -61,7 +61,15 @@ public class OpenApiConfig {
                                 `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`.
 
                                 **Send `Idempotency-Key`** on every send. A retry with the same key and
-                                body replays the original response instead of sending twice.""")
+                                body replays the original response instead of sending twice.
+
+                                **Building a platform?** If you resell WhatsApp to your own users, see
+                                the **Customers**, **Campaigns**, **Audiences** and **Media** groups
+                                below and the partner guide at
+                                [`docs/partners.md`](https://github.com/wasparks/api-service/blob/main/docs/partners.md)
+                                — register each user as a customer, send them a setup link to connect
+                                their own number, then act for any of them with one key by naming the
+                                customer in `X-Tenant-Id`.""")
                         .license(new License().name("Proprietary")))
                 .servers(List.of(new Server().url(publicBaseUrl).description("WaSparks API")))
                 .components(new Components()
@@ -80,13 +88,38 @@ public class OpenApiConfig {
                 .build();
     }
 
-    /** Everything Meta has no shape for. */
+    /**
+     * Everything Meta has no shape for — minus the Partner console, which has its own group.
+     *
+     * <p>The console is excluded rather than merged because it is a different audience with a different
+     * credential: everything else in {@code v1} is called server-to-server with an API key, while
+     * {@code /v1/partner/**} is called by our own front end with a session token. Showing both in one
+     * list would put two authentication schemes on one page and leave a reader guessing which applies.
+     */
     @Bean
     public GroupedOpenApi v1Group() {
         return GroupedOpenApi.builder()
                 .group("v1")
                 .displayName("WaSparks v1")
                 .pathsToMatch("/v1/**")
+                .pathsToExclude("/v1/partner/**")
+                .build();
+    }
+
+    /**
+     * The Partner console backend (api-partner epic §B6).
+     *
+     * <p>Documented rather than hidden, even though its only caller is tenant-web, because a partner
+     * integrating deeply will want to know what the console can do that the API cannot — and because the
+     * two surfaces perform the same operations, so seeing them side by side is how a reader confirms
+     * that.
+     */
+    @Bean
+    public GroupedOpenApi partnerGroup() {
+        return GroupedOpenApi.builder()
+                .group("partner")
+                .displayName("Partner console")
+                .pathsToMatch("/v1/partner/**")
                 .build();
     }
 }

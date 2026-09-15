@@ -4,10 +4,15 @@ The public developer API for WaSparks — Java 21, Spring Boot 3.3, port **8083*
 **developer.wasparks.com** (docs at **developers.wasparks.com**).
 
 It is a **gateway, not a second send path**. Every WhatsApp action is performed by tenants-service over
-its docker-network-only `/internal/v1/**` surface. What lives here is everything tenants-service must
-not have to know about: API keys, plans, rate limits, message quotas, idempotency, the send queue,
-usage rollups and outbound webhooks. It is also the only service in the estate that talks to Redis, and
-it never calls Meta directly.
+its docker-network-only `/internal/v1/**` surface, and every tenant is created by admin-service over its
+own. What lives here is everything neither of them should have to know about: API keys, plans, rate
+limits, message quotas, idempotency, the send queue, usage rollups and outbound webhooks. It is also the
+only service in the estate that talks to Redis, and it never calls Meta directly.
+
+It is also the **partner platform** (api-partner epic): a partner is a tenant that resells WhatsApp to
+its own users, registers them as customers here, connects their numbers through hosted setup links, and
+sends and receives on their behalf with one key and one webhook endpoint. See
+[`docs/partners.md`](docs/partners.md).
 
 ---
 
@@ -47,9 +52,9 @@ Swagger UI is at <http://localhost:8083/docs>, and the hand-written quickstart i
 
 ### Schema
 
-No Flyway (shared-contracts §4). Apply `modules/_shared/database/020_api_ecosystem.sql` and then
-`020a_api_keys_ui_session.sql` by hand, once per environment, before first boot — `ddl-auto=validate` will refuse to start otherwise, which is the
-point.
+No Flyway (shared-contracts §4). Apply `modules/_shared/database/020_api_ecosystem.sql`, then
+`020a_api_keys_ui_session.sql`, then `021_api_partners.sql` by hand, once per environment, before first
+boot — `ddl-auto=validate` will refuse to start otherwise, which is the point.
 
 ### Tests
 
@@ -57,7 +62,7 @@ point.
 mvn test
 ```
 
-120 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
+234 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
 must be running. The schema comes from `src/test/resources/db/schema-test.sql`, a trimmed transcript of
 the real migrations, and the entities are validated against it exactly as they are in production.
 
@@ -80,6 +85,8 @@ the real migrations, and the entities are validated against it exactly as they a
 | `TENANTS_JWT_SECRET` | **prod, must match** | dev default | HS256 key used to *verify* tenant sessions on `/v1/keys`. Identical to tenants-service. 32+ chars. |
 | `INTERNAL_API_SECRET` | **prod, must match** | dev default | Shared bearer for `/internal/v1/**`. Identical to tenants-service. 32+ chars. |
 | `TENANTS_SERVICE_BASE_URL` | prod | `http://localhost:8081` | In compose: `http://tenants-service:8081`. |
+| `ADMIN_SERVICE_BASE_URL` | **prod** | `http://localhost:8080` | The second internal upstream: it creates a partner's client tenants and answers the "is this tenant a partner?" resolve. In compose: `http://admin-service:8080`. admin-service needs the same `INTERNAL_API_SECRET`, and nginx must `return 404` for `/internal/` on `admin-api.wasparks.com`. |
+| `APP_PUBLIC_BASE_URL` | **prod** | `http://localhost:5173` | Where a hosted setup link points — tenant-web serves `/setup/{token}`. Prod: `https://app.wasparks.com`. A wrong value here produces links that 404 for a partner's customer. |
 | `API_PUBLIC_BASE_URL` | no | `http://localhost:8083` | Shown in the docs and the quickstart. |
 | `APP_CORS_ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated browser origins allowed on `/v1/**` (tenant-web). Prod: `https://app.wasparks.com`. `/meta/**` stays CORS-disabled — nothing there is ever called from a browser. |
 | `SEND_WORKERS` | no | `8` | Send-worker threads. **`0` accepts sends but drains nothing** — a valid shape if you separate API and worker instances. |
@@ -91,6 +98,11 @@ the real migrations, and the entities are validated against it exactly as they a
 | `WEBHOOK_RETRY_BACKOFF_MS` | no | `10000,60000,300000,1800000,7200000` | Delivery retry schedule, then EXHAUSTED. |
 | `WEBHOOK_PAUSE_AFTER_FAILURES` | no | `100` | Consecutive failures before an endpoint is PAUSED. |
 | `USAGE_FLUSH_MS` | no | `600000` | Redis counters → `api_usage_daily`. |
+| `API_PARTNER_CACHE_TTL_SECONDS` | no | `60` | How long the partner → clients hash is cached. Bounds only out-of-band changes; a create, suspend or cap change invalidates it immediately. |
+| `API_MAX_INLINE_RECIPIENTS` | no | `5000` | Recipients or members accepted in one campaign/audience request. |
+| `API_MAX_CSV_SIZE` | no | `10MB` | Recipient CSV cap. tenants-service applies its own 16 MB limit too; the smaller of the two wins. |
+| `API_SETUP_LINK_TTL_HOURS` | no | `168` | Default setup-link lifetime when a partner does not ask for one. |
+| `API_SCHEDULED_QUOTA_POLL_MS` / `API_SCHEDULED_QUOTA_LOOKAHEAD_MINUTES` | no | `60000` / `5` | How often, and how far ahead, scheduled campaigns have their quota reserved. |
 
 **The prod profile refuses to boot** if `ENCRYPTION_SECRET`, `TENANTS_JWT_SECRET` or
 `INTERNAL_API_SECRET` is missing, too short, or still a development default. That guard exists because
@@ -127,8 +139,20 @@ drains the stream, calls tenants-service, and the outcome reaches the client by 
 `GET /v1/messages/{id}`.
 
 Meanwhile `OutboxPoller` drains `api_outbox_events` — rows tenants-service writes in the same
-transaction as the state change — fans each event out to the tenant's matching endpoints, and
-`WebhookDispatcher` delivers them with an HMAC signature and a retry schedule.
+transaction as the state change — fans each event out to the tenant's matching endpoints **and to the
+endpoints of the partner that owns that tenant, if any**, and `WebhookDispatcher` delivers them with an
+HMAC signature and a retry schedule.
+
+On a partner key the pipeline gains one step before all of it: `X-Tenant-Id` is resolved to a *verified*
+acting tenant in the auth filter, so every later stage — the limiters, the quota counters, the internal
+client — reads one field and cannot be pointed at a customer the key does not hold. That resolution is
+the security boundary of the whole partner surface; see `PartnerTenantResolver`.
+
+A **client key** — one a partner issued for a single customer — goes through the same step. It carries no
+`partner_id` and sends no `X-Tenant-Id`, but its tenant is somebody's customer, so it runs in that
+partner's context: the pooled allowance, the cap the partner set, and the same `403 customer_suspended`.
+The exception is a client tenant an admin has explicitly assigned a plan, which keeps that plan and its
+own counters.
 
 ## Endpoints
 
@@ -141,6 +165,16 @@ transaction as the state change — fans each event out to the tenant's matching
 | GET | `/v1/account` | API key | `account:read` |
 | GET/POST | `/v1/webhooks` · GET/PATCH/DELETE `/{id}` · POST `/{id}/test` · GET `/{id}/deliveries` · POST `/{id}/deliveries/{deliveryId}/retry` | API key | `webhooks:manage` |
 | GET/POST | `/v1/keys` · DELETE `/v1/keys/{id}` | **tenant JWT** (OWNER/ADMIN) | — |
+| POST/GET | `/v1/customers` · GET/PATCH `/{id}` | **partner key** | `customers:read` / `customers:write` |
+| POST/GET | `/v1/customers/{id}/setup-links` · GET `/{linkId}` · POST `/{linkId}/cancel` | partner key | `customers:*` |
+| POST/GET | `/v1/customers/{id}/phone-numbers` (direct mapping) | partner key | `customers:*` |
+| POST/GET | `/v1/customers/{id}/keys` (client keys) | partner key | `customers:*` |
+| POST/GET | `/v1/campaigns` · GET `/{id}` · POST `/{id}/start`, `/pause`, `/resume`, `/cancel` · GET/POST `/{id}/recipients` | API key | `campaigns:read` / `campaigns:write` |
+| POST/GET | `/v1/audiences` · GET `/{id}` · GET/POST/DELETE `/{id}/members` · DELETE `/{id}` | API key | `campaigns:*` |
+| POST | `/v1/uploads/csv` (multipart, streamed) | API key | `campaigns:write` |
+| GET | `/v1/media/{messageId}` → 302 | API key | `media:read` |
+| GET | `/v1/webhooks/events` | API key | `webhooks:manage` |
+| various | `/v1/partner/**` — the console: customers, setup links, keys, webhooks, usage, campaigns (incl. the merged cross-client list and `/campaigns/{id}/recipients`) | **tenant JWT** (OWNER/ADMIN of a partner) | — |
 | GET | `/actuator/health` · `/docs` · `/v3/api-docs` | public | — |
 
 ## Deploying
@@ -150,6 +184,40 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
 `developer.wasparks.com` here and `developers.wasparks.com` to `/docs`, and — belt and braces —
 `api.wasparks.com` must keep `location /internal/ { return 404; }`.
 
+## Changelog
+
+### 2026-09-16 — `GET /v1/templates` answers in the house envelope · **breaking**
+
+Every collection read on `/v1` now returns `{data, meta}` and pages with `cursor`/`limit`.
+`GET /v1/templates` was the last one that did not: it shipped in P1 handing tenants-service's paged
+shape straight through, which meant clients were parsing our upstream's contract rather than ours.
+
+**Before**
+
+```json
+{ "content": [ { "id": "…", "name": "order_update" } ],
+  "number": 0, "size": 25, "totalElements": 61, "totalPages": 3, "last": false }
+```
+`GET /v1/templates?page=1&size=25`
+
+**After**
+
+```json
+{ "data": [ { "id": "…", "name": "order_update" } ],
+  "meta": { "next_cursor": "MQ" } }
+```
+`GET /v1/templates?cursor=MQ&limit=25`
+
+**To migrate:** read `data` instead of `content`, and walk by passing the previous response's
+`meta.next_cursor` back as `?cursor=` until it is absent, instead of incrementing `page`. `size`
+becomes `limit` (same default of 25, same maximum of 100). The cursor is opaque — do not construct
+one; a value we did not issue is rejected rather than silently restarting the walk.
+
+`totalElements` has no replacement. It was never part of the documented contract, and the envelope
+does not promise a count because the underlying reads cannot produce one cheaply on every path.
+
+Nothing else about the endpoint changed: the same filters, the same rows, the same scope.
+
 ## Known gaps
 
 - **Webhook auto-pause does not email the tenant** (epic §B8). An endpoint paused after 100 consecutive
@@ -157,5 +225,18 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
   `EmailService` contract and a `noreply` template.
 - **`api_usage_daily.messages_sent` / `messages_failed` stay zero.** This service sees an accept, not a
   delivery. The nightly reconciliation from `messages` that fills them is P1.1.
-- **Partner (white-label) support is schema only.** `api_partners` is mapped and `partner_id` travels
-  through the principal, but nothing writes it in P1.
+- **`PATCH /internal/v1/tenants/{id}/settings` does not exist yet.** The Partner console's
+  frequency-guard switch (`PATCH /v1/partner/customers/{id}/settings`) is built against it and starts
+  working the moment tenants-service ships it; until then it answers `404`. It is the one internal
+  endpoint this build needed that `internal.md` lacks.
+- **`app_access` is stored and reported but nothing acts on it** — the branded client login is a later
+  phase of the partner epic.
+- **Two internal endpoints this build calls are not in `internal.md`**: `GET
+  /internal/v1/tenants/{id}/settings` (only the PATCH is documented) and `GET
+  /internal/v1/campaigns/across`. Both are implemented against the paths the hand-off named and read
+  defensively, and `minDaysBetweenMarketing` degrades to `0` if the GET is missing — but the shapes are
+  assumptions until `internal.md` catches up.
+- **`GET /v1/partner/campaigns/{id}/recipients` without `customerId` costs a lookup per customer.** There
+  is no cross-tenant campaign read, so the owner is found by asking each of the partner's tenants in
+  turn. The console passes `customerId` from the row it was already showing; the fallback is for a pasted
+  id. A partner with hundreds of customers should not rely on it.

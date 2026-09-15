@@ -37,7 +37,7 @@ class IdempotencyRedisOutageTest {
 
     private static final ApiPrincipal PRINCIPAL = new ApiPrincipal(
             UUID.randomUUID(), UUID.randomUUID(), null, ApiKeyMode.LIVE,
-            Set.of("messages:send"), null);
+            Set.of("messages:send"), null, null);
 
     private IdempotencyService service;
 

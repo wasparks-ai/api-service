@@ -48,6 +48,24 @@ public enum ApiErrorCode {
     UNKNOWN_API_KEY("unknown_api_key", HttpStatus.UNAUTHORIZED, 0, null, "OAuthException",
             "This API key is not usable. Create a new one."),
 
+    /**
+     * The acting client exists and is this partner's, but the partner has SUSPENDED it (§B2). Not a 404:
+     * the partner set this state itself and must be able to see the customer in order to lift it. A
+     * tenant that is <em>not</em> this partner's stays a 404 — see {@code PartnerTenantResolver}.
+     */
+    CUSTOMER_SUSPENDED("customer_suspended", HttpStatus.FORBIDDEN, 0, null, "OAuthException",
+            "This customer is suspended."),
+    /**
+     * A tenant JWT reached {@code /v1/partner/**} for a tenant that is not a partner (§B6). Rendered as
+     * a 404 rather than a 403 because, to everyone who is not a partner, the console simply does not
+     * exist — tenant-web hides the whole section on the same signal.
+     */
+    NOT_A_PARTNER("not_a_partner", HttpStatus.NOT_FOUND, 0, null, "OAuthException",
+            "This account is not a WaSparks partner."),
+    /** A partner-only endpoint reached with an ordinary tenant key (§B2). */
+    PARTNER_KEY_REQUIRED("partner_key_required", HttpStatus.FORBIDDEN, 0, null, "OAuthException",
+            "This endpoint is available to partner API keys only."),
+
     // ---- limits (epic §B3, §B4) ----
     RATE_LIMITED("rate_limited", HttpStatus.TOO_MANY_REQUESTS, 130429, null, "OAuthException",
             "Too many requests. Retry after the window resets."),
@@ -78,6 +96,54 @@ public enum ApiErrorCode {
             "The number's daily messaging limit has been reached."),
     DUPLICATE_MESSAGE_ID("duplicate_message_id", HttpStatus.CONFLICT, 100, null, "OAuthException",
             "A message with this id already exists."),
+
+    // ---- partner platform: direct number mapping (§0.5 / internal.md POST /internal/v1/accounts/map) ----
+    /**
+     * Meta refused the token the partner supplied. Passed through from tenants-service unchanged: the
+     * three mapping failures are the partner's to act on, and collapsing them into one
+     * {@code invalid_request} would leave it unable to tell "wrong token" from "wrong WABA".
+     */
+    TOKEN_INVALID("token_invalid", HttpStatus.UNAUTHORIZED, 190, null, "OAuthException",
+            "Meta rejected that access token."),
+    NUMBER_NOT_IN_WABA("number_not_in_waba", HttpStatus.UNPROCESSABLE_ENTITY, 100, null,
+            "OAuthException",
+            "That phone number does not belong to the WhatsApp Business Account you named."),
+    /**
+     * The WABA has not granted our Meta app access, so the number could send but would never receive a
+     * reply — and we never store a number that cannot receive replies (§0.5). Upstream attaches a
+     * {@code docsUrl} to the guide; it is carried through into {@code error.details}.
+     */
+    WABA_NOT_SHARED("waba_not_shared", HttpStatus.UNPROCESSABLE_ENTITY, 100, null, "OAuthException",
+            "This WhatsApp Business Account has not been shared with WaSparks."),
+    /**
+     * Some tenant already holds that number — possibly this one. The message is identical either way,
+     * because saying which tenant holds it would leak that the number is on the platform at all.
+     */
+    ALREADY_MAPPED("already_mapped", HttpStatus.CONFLICT, 100, null, "OAuthException",
+            "That phone number is already connected."),
+
+    // ---- partner platform: setup links, campaigns, audiences, uploads (§B2, §B3, §B3a) ----
+    /** The setup link is not PENDING: completed, cancelled, or past {@code expires_at}. */
+    LINK_UNUSABLE("link_unusable", HttpStatus.CONFLICT, 100, null, "OAuthException",
+            "This setup link can no longer be used."),
+    /** A campaign transition the state machine does not allow — resuming one that never paused. */
+    CAMPAIGN_STATE("campaign_state", HttpStatus.CONFLICT, 100, null, "OAuthException",
+            "The campaign is not in a state that allows that."),
+    AUDIENCE_NOT_FOUND("audience_not_found", HttpStatus.NOT_FOUND, 100, null, "OAuthException",
+            "No audience with that id."),
+    /** Deleting an audience a SCHEDULED or RUNNING campaign still points at. */
+    AUDIENCE_IN_USE("audience_in_use", HttpStatus.CONFLICT, 100, null, "OAuthException",
+            "This audience backs a campaign that has not finished."),
+    /**
+     * The CSV is gone. Uploads live 24 hours under a bucket lifecycle rule and there is no upload table,
+     * so an expired id is indistinguishable from one that never existed — which is the honest answer
+     * either way (internal.md, CSV upload).
+     */
+    UPLOAD_NOT_FOUND("upload_not_found", HttpStatus.NOT_FOUND, 100, null, "OAuthException",
+            "No CSV upload with that id. Uploads expire after 24 hours — upload the file again."),
+    /** The message has no stored attachment, or belongs to another tenant (§B4). */
+    MEDIA_NOT_FOUND("media_not_found", HttpStatus.NOT_FOUND, 100, null, "OAuthException",
+            "No media is stored for that message."),
 
     // ---- generic (internal.md error envelope) ----
     VALIDATION_FAILED("validation_failed", HttpStatus.BAD_REQUEST, 100, null, "OAuthException",

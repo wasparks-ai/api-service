@@ -68,7 +68,8 @@ class SendWorkerIntegrationTest extends BaseIntegrationTest {
         InternalDtos.SendRequest payload = new InternalDtos.SendRequest(
                 messageId.toString(), phoneNumberId, "+919876543210", "text", "Hi",
                 null, null, "LIVE", "order-1");
-        return new SendJob(messageId, tenantId, apiKeyId, "LIVE", payload, "order-1");
+        // No partner context: an ordinary tenant key, which is what every P1 send is.
+        return new SendJob(messageId, tenantId, apiKeyId, "LIVE", payload, "order-1", null);
     }
 
     /** Enqueue, then read the entry back as the worker would. */
