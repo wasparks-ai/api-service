@@ -65,6 +65,7 @@ public class PartnerCustomerService {
     private final TenantRefRepository tenantRefRepository;
     private final WhatsAppAccountRefRepository accountRepository;
     private final PartnerTenantResolver partnerTenantResolver;
+    private final CustomerSettingsService settingsService;
     private final ApiKeyService apiKeyService;
     private final ApiKeyRepository apiKeyRepository;
     private final QuotaService quotaService;
@@ -114,7 +115,8 @@ public class PartnerCustomerService {
         partnerTenantResolver.invalidate(partnerId);
 
         UUID tenantId = tenantId(created.tenant());
-        return new CreateResult(toPublic(partnerId, tenantId, created.tenant()), created.created());
+        return new CreateResult(toPublic(partnerId, tenantId, created.tenant(), principal.keyId()),
+                created.created());
     }
 
     @Transactional(readOnly = true)
@@ -123,7 +125,7 @@ public class PartnerCustomerService {
         List<Map<String, Object>> customers = new ArrayList<>();
         for (ApiPartnerTenant link : partnerTenantRepository.findByPartnerIdOrderByCreatedAtDesc(
                 partnerId)) {
-            customers.add(toPublic(link));
+            customers.add(toPublic(link, principal.keyId()));
         }
         return customers;
     }
@@ -137,7 +139,7 @@ public class PartnerCustomerService {
      */
     @Transactional(readOnly = true)
     public Map<String, Object> get(ApiPrincipal principal, UUID customerId) {
-        return toPublic(requireLink(principal, customerId));
+        return toPublic(requireLink(principal, customerId), principal.keyId());
     }
 
     /** What a PATCH may change. Null means "leave it alone"; see {@link #clearCap} for the third state. */
@@ -196,13 +198,14 @@ public class PartnerCustomerService {
         }
 
         ApiPartnerTenant saved = partnerTenantRepository.save(link);
+        UUID actorKeyId = principal.keyId();
         // Status and cap both change what the resolver hands the quota check, so both caches holding
         // them are stale the moment either moves: the partner's membership hash (the X-Tenant-Id path)
         // and this customer's own client-key context. Dropping only one would leave a client key
         // sending against a cap the console says it no longer has.
         partnerTenantResolver.invalidate(link.getPartnerId());
         partnerTenantResolver.invalidateClient(link.getTenantId());
-        return toPublic(saved);
+        return toPublic(saved, actorKeyId);
     }
 
     /**
@@ -315,7 +318,7 @@ public class PartnerCustomerService {
      * reason {@code GET /v1/account} does: the table lags by a flush interval, and a partner watching a
      * customer approach its cap needs the number the next send will be checked against.
      */
-    private Map<String, Object> toPublic(ApiPartnerTenant link) {
+    private Map<String, Object> toPublic(ApiPartnerTenant link, UUID apiKeyId) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("id", link.getTenantId().toString());
         body.put("externalRef", link.getExternalRef());
@@ -324,6 +327,10 @@ public class PartnerCustomerService {
         body.put("appAccess", link.isAppAccess());
         body.put("cap", link.getMessagesPerDayCap());
         body.put("createdVia", link.getCreatedVia().name());
+        // tenants-service owns this column, so it is an internal read rather than a field of the link
+        // row — cached per customer, because a list of two hundred would otherwise be two hundred calls.
+        body.put("minDaysBetweenMarketing",
+                settingsService.frequencyGuardDays(link.getTenantId(), apiKeyId));
         body.put("phoneNumbers", phoneNumbers(link.getTenantId()));
         QuotaService.Usage usage = quotaService.peek(link.getTenantId());
         body.put("usage", Map.of("today", usage.today(), "month", usage.month()));
@@ -335,9 +342,10 @@ public class PartnerCustomerService {
      * The same shape built from admin-service's response, for the moment right after a create when the
      * link row exists but this service has not read it back.
      */
-    private Map<String, Object> toPublic(UUID partnerId, UUID tenantId, JsonNode upstream) {
+    private Map<String, Object> toPublic(UUID partnerId, UUID tenantId, JsonNode upstream,
+                                        UUID apiKeyId) {
         return partnerTenantRepository.findByPartnerIdAndTenantId(partnerId, tenantId)
-                .map(this::toPublic)
+                .map(link -> toPublic(link, apiKeyId))
                 .orElseGet(() -> {
                     // The row must exist — admin-service just wrote it — so this is a read-your-writes
                     // gap across two services rather than a missing customer. Answer from upstream's own
@@ -351,6 +359,8 @@ public class PartnerCustomerService {
                     body.put("cap", upstream.hasNonNull("messagesPerDayCap")
                             ? upstream.get("messagesPerDayCap").asInt() : null);
                     body.put("createdVia", text(upstream, "createdVia"));
+                    // A customer created a millisecond ago cannot have a guard set on it yet.
+                    body.put("minDaysBetweenMarketing", CustomerSettingsService.GUARD_OFF);
                     body.put("phoneNumbers", List.of());
                     body.put("usage", Map.of("today", 0, "month", 0));
                     body.put("createdAt", text(upstream, "linkedAt"));

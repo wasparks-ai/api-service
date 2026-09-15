@@ -50,8 +50,8 @@ curl -X POST https://developer.wasparks.com/v1/customers \
 
 ```json
 { "id": "6d0b…", "externalRef": "cust_8842", "name": "Rahul Realty",
-  "status": "ACTIVE", "cap": 500, "phoneNumbers": [],
-  "usage": { "today": 0, "month": 0 } }
+  "status": "ACTIVE", "cap": 500, "minDaysBetweenMarketing": 0,
+  "phoneNumbers": [], "usage": { "today": 0, "month": 0 } }
 ```
 
 `id` is the customer's tenant id — the value you will put in `X-Tenant-Id` from here on. Store it
@@ -394,6 +394,9 @@ With this set, campaign creation skips any recipient who already received a MARK
 customer within seven days and reports them as `counts.frequencySkipped`. UTILITY and AUTHENTICATION
 templates are never guarded. `0` (the default) is off.
 
+The value in force comes back on every customer row as `minDaysBetweenMarketing`, on both
+`GET /v1/customers` and the console's own list, so you never have to remember what you set.
+
 It **fails open**: if the check cannot be evaluated the campaign sends to everyone and we log it, because
 a customer unable to send at all is worse than one that over-sends once.
 
@@ -451,3 +454,8 @@ WABA and Meta.
   migrating from the Meta Cloud API.
 - **Partner console** — in WaSparks under **Partner**, if your account has been enabled. Everything here
   is also possible by hand there: creating customers, generating links, issuing keys, watching usage.
+  It also has two views the API does not: **every customer's campaigns in one list**
+  (`GET /v1/partner/campaigns`, each row carrying `customerId` and `customerName`, or
+  `?customerId=self` for your own account), and **a campaign's recipients**
+  (`GET /v1/partner/campaigns/{id}/recipients?status=&cursor=`) so support can see exactly who was not
+  sent to and why. Both are read-only and authenticated with your WaSparks session, not with a key.

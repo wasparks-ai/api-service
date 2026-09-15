@@ -27,11 +27,13 @@ import reactor.netty.http.client.HttpClient;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * The only way this service reaches tenants-service (epic §0.2, §C1).
@@ -218,9 +220,39 @@ public class InternalTenantsClient {
 
     public JsonNode campaignRecipients(ApiPrincipal principal, String id,
                                        MultiValueMap<String, String> query) {
+        return campaignRecipients(principal.tenantId(), principal.keyId(), id, query);
+    }
+
+    public JsonNode campaignRecipients(UUID tenantId, UUID apiKeyId, String id,
+                                       MultiValueMap<String, String> query) {
         return exchange(HttpMethod.GET,
                 uri -> uri.path("/internal/v1/campaigns/{id}/recipients").queryParams(query).build(id),
-                principal.tenantId(), principal.keyId(), null, JsonNode.class);
+                tenantId, apiKeyId, null, JsonNode.class);
+    }
+
+    /**
+     * Campaigns across several tenants in one call — the Partner console's cross-client list (§B6).
+     *
+     * <p>The one read on this surface that is not scoped to a single tenant, which is why it names its
+     * tenants explicitly rather than relying on the header. {@code X-Tenant-Id} is still sent, and is
+     * still the partner's own tenant, so the audit context and the chain's own rules are unchanged;
+     * upstream is expected to refuse any id in {@code tenantIds} that the caller has not been cleared
+     * for. This service only ever passes ids it has already proved belong to the partner.
+     *
+     * <p><b>This endpoint is not in internal.md.</b> The path and the {@code tenantIds} parameter are
+     * what the hand-off named; the response is read defensively ({@code content}, {@code data} or a bare
+     * array, and each row's {@code tenantId}) so a shape that differs in the details still works. See the
+     * report.
+     */
+    public JsonNode campaignsAcross(UUID actingTenantId, UUID apiKeyId, List<UUID> tenantIds,
+                                    MultiValueMap<String, String> query) {
+        String ids = tenantIds.stream().map(UUID::toString).collect(Collectors.joining(","));
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/campaigns/across")
+                        .queryParams(query)
+                        .queryParam("tenantIds", ids)
+                        .build(),
+                actingTenantId, apiKeyId, null, JsonNode.class);
     }
 
     public JsonNode appendCampaignRecipients(ApiPrincipal principal, String id, JsonNode body) {
@@ -399,15 +431,27 @@ public class InternalTenantsClient {
      * Write a tenant setting the Partner console owns — today only the marketing frequency guard
      * ({@code tenants.min_days_between_marketing}, 021 §8).
      *
-     * <p><b>This endpoint is not in internal.md yet.</b> The hand-off anticipated that and says to request
-     * it; it is implemented here against the agreed path so the console works the moment tenants-service
-     * ships it, and a 404 from upstream surfaces as a plain "not available yet" rather than as a
-     * confusing generic failure. See the hand-off report §9.
+     * <p>tenants-service is the writer of that column, not this service (internal.md, Customer settings):
+     * one writer per column, and it is the service that reads it at campaign create. The path id must
+     * equal the {@code X-Tenant-Id} we resolved, which is why both come from the same principal.
      */
     public JsonNode updateTenantSettings(ApiPrincipal principal, Object body) {
         return exchange(HttpMethod.PATCH,
                 uri -> uri.path("/internal/v1/tenants/{id}/settings").build(principal.tenantId()),
                 principal.tenantId(), principal.keyId(), body, JsonNode.class);
+    }
+
+    /**
+     * Read those same settings back.
+     *
+     * <p><b>The GET is not in internal.md</b> — only the PATCH is. The path is the obvious counterpart
+     * and is what the hand-off named; the response is read as {@code {tenantId, minDaysBetweenMarketing}},
+     * mirroring what the PATCH returns. See the report.
+     */
+    public JsonNode getTenantSettings(UUID tenantId, UUID apiKeyId) {
+        return exchange(HttpMethod.GET,
+                uri -> uri.path("/internal/v1/tenants/{id}/settings").build(tenantId),
+                tenantId, apiKeyId, null, JsonNode.class);
     }
 
     // ------------------------------------------------------------------ account

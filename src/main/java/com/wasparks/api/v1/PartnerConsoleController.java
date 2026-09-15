@@ -1,6 +1,7 @@
 package com.wasparks.api.v1;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasparks.api.auth.ApiKeyService;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.CurrentPrincipal;
@@ -14,6 +15,7 @@ import com.wasparks.api.error.ApiException;
 import com.wasparks.api.internal.InternalTenantsClient;
 import com.wasparks.api.internal.UpstreamRejectedException;
 import com.wasparks.api.internal.UpstreamUnavailableException;
+import com.wasparks.api.partner.CustomerSettingsService;
 import com.wasparks.api.partner.PartnerConsoleService;
 import com.wasparks.api.partner.PartnerCustomerService;
 import com.wasparks.api.partner.SetupLinkService;
@@ -42,10 +44,12 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -81,6 +85,8 @@ public class PartnerConsoleController {
     private final InternalTenantsClient tenantsClient;
     private final ApiKeyService apiKeyService;
     private final ApiKeyRepository apiKeyRepository;
+    private final CustomerSettingsService settingsService;
+    private final ObjectMapper objectMapper;
 
     // ------------------------------------------------------------------ identity
 
@@ -203,6 +209,9 @@ public class PartnerConsoleController {
         ApiPrincipal acting = customerService.actingOn(principal, id);
         proxy(() -> tenantsClient.updateTenantSettings(acting,
                 Map.of("minDaysBetweenMarketing", days)));
+        // The customer list reads this back through a cache; drop it now so the next screen shows what
+        // was just set rather than what it replaced.
+        settingsService.invalidate(id);
         return Map.of("customerId", id.toString(), "minDaysBetweenMarketing", days);
     }
 
@@ -372,19 +381,21 @@ public class PartnerConsoleController {
     @GetMapping("/campaigns")
     @Operation(summary = "Campaigns across your customers",
             description = """
-                    Read-only. You build your own campaign UI — this is here so that support can see what
-                    a customer's campaigns are doing without asking you to look.
+                    Read-only. You build your own campaign UI — this is here so that support can answer
+                    "did that go out?" without asking you to look.
 
-                    Pass `customerId` to narrow to one customer; without it you get your own tenant's.""")
-    public JsonNode campaigns(@RequestParam(required = false) UUID customerId,
-                              @RequestParam(required = false) String status,
-                              @RequestParam(required = false) Integer page,
-                              @RequestParam(required = false) Integer size) {
+                    With no `customerId` you get **every** customer's campaigns merged into one list,
+                    newest first, each row carrying `customerId` and `customerName` so the table can name
+                    who it belongs to. Suspended customers are left out — their campaigns are not running
+                    and cannot be started.
+
+                    Pass `customerId` to narrow to one customer, or `customerId=self` for your own
+                    account. Your own tenant has no customer id of its own, which is what `self` is for.""")
+    public Object campaigns(@RequestParam(required = false) String customerId,
+                            @RequestParam(required = false) String status,
+                            @RequestParam(required = false) Integer page,
+                            @RequestParam(required = false) Integer size) {
         PartnerConsoleService.Console console = console();
-        ApiPrincipal acting = customerId == null
-                ? console.principal()
-                : customerService.actingOn(console.principal(), customerId);
-
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
         if (status != null && !status.isBlank()) {
             query.add("status", status);
@@ -394,13 +405,134 @@ public class PartnerConsoleController {
         }
         query.add("size", String.valueOf(PagedResponse.clampLimit(size)));
 
+        UUID selected = consoleService.resolveCustomerSelector(console, customerId);
+        if (selected == null) {
+            return consoleService.campaignsAcross(console, query);
+        }
+
+        // A named customer goes through the ordinary per-tenant read, which re-proves the link — the
+        // merged list proves it differently (it only ever asks for tenants it has already resolved), and
+        // both paths have to prove it somehow.
+        ApiPrincipal acting = selected.equals(console.principal().partner().ownerTenantId())
+                ? console.principal()
+                : customerService.actingOn(console.principal(), selected);
         return proxy(() -> tenantsClient.listCampaigns(acting.tenantId(), acting.keyId(), query));
+    }
+
+    @GetMapping("/campaigns/{id}/recipients")
+    @Operation(summary = "A campaign's recipients",
+            description = """
+                    Every recipient with its outcome, **including the ones that were not sent to** —
+                    filter with `status=SUPPRESSED`, `SKIPPED_FREQUENCY` or `INVALID` to see exactly who
+                    and why, which is the usual reason support opens this screen.
+
+                    The campaign must be yours or one of your customers'.
+
+                    Pass the `customerId` from the campaigns list. Without it we work out which of your
+                    customers the campaign belongs to, which costs a lookup per customer — fine for a
+                    pasted id, wasteful for a screen that already knows.
+
+                    `cursor` comes from `meta.next_cursor` on the previous page; omit it for the first.""")
+    public PagedResponse<Object> campaignRecipients(
+            @PathVariable String id,
+            @RequestParam(required = false) String customerId,
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false) String cursor,
+            @RequestParam(required = false) Integer limit) {
+        PartnerConsoleService.Console console = console();
+        int size = PagedResponse.clampLimit(limit);
+        int page = decodeCursor(cursor);
+
+        UUID owner = consoleService.resolveCustomerSelector(console, customerId);
+        ApiPrincipal acting = owner == null
+                ? consoleService.findCampaignOwner(console, id)
+                : ownerPrincipal(console, owner);
+
+        MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
+        if (status != null && !status.isBlank()) {
+            query.add("status", status);
+        }
+        query.add("page", String.valueOf(page));
+        query.add("size", String.valueOf(size));
+
+        JsonNode upstream = proxy(() -> tenantsClient.campaignRecipients(
+                acting.tenantId(), acting.keyId(), id, query));
+        return recipientsPage(upstream, page, size);
     }
 
     // ------------------------------------------------------------------ helpers
 
     private PartnerConsoleService.Console console() {
         return consoleService.resolve(CurrentPrincipal.tenantUser());
+    }
+
+    /** The partner's own tenant needs no link check; anything else is re-proved. */
+    private ApiPrincipal ownerPrincipal(PartnerConsoleService.Console console, UUID tenantId) {
+        return tenantId.equals(console.principal().partner().ownerTenantId())
+                ? console.principal()
+                : customerService.actingOn(console.principal(), tenantId);
+    }
+
+    /**
+     * The cursor is an opaque encoding of a page number.
+     *
+     * <p>Upstream pages this list by offset, and the {@code /v1} envelope promises a cursor
+     * ({@code PagedResponse}) — so one of the two has to be translated, and translating here keeps the
+     * public contract cursor-shaped while nothing upstream changes. It is base64 so that it reads as an
+     * opaque token rather than inviting a caller to do arithmetic on it: the encoding is ours to change
+     * the day this list gets a real keyset cursor.
+     */
+    private int decodeCursor(String cursor) {
+        if (cursor == null || cursor.isBlank()) {
+            return 0;
+        }
+        try {
+            String decoded = new String(Base64.getUrlDecoder().decode(cursor.trim()),
+                    StandardCharsets.UTF_8);
+            int page = Integer.parseInt(decoded);
+            if (page < 0) {
+                throw new NumberFormatException(decoded);
+            }
+            return page;
+        } catch (RuntimeException e) {
+            throw ApiException.of(ApiErrorCode.VALIDATION_FAILED,
+                    "`cursor` is not one we issued. Omit it to start from the first page.");
+        }
+    }
+
+    private String encodeCursor(int page) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(String.valueOf(page).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Upstream's page into the house envelope, with a {@code next_cursor} only when there is more.
+     *
+     * <p>"More" is decided from the row count rather than from a total, because a total is the one field
+     * a paged response cannot be relied on to carry. A full page means there may be another; a short one
+     * is the end. The cost is a single empty last page in the exact-multiple case, which a client that
+     * loops until {@code next_cursor} is absent handles without noticing.
+     */
+    private PagedResponse<Object> recipientsPage(JsonNode upstream, int page, int size) {
+        List<Object> rows = new ArrayList<>();
+        JsonNode content = upstream == null ? null
+                : (upstream.isArray() ? upstream : firstArray(upstream, "content", "data",
+                        "recipients"));
+        if (content != null) {
+            content.forEach(row -> rows.add(objectMapper.convertValue(row, Object.class)));
+        }
+        String next = rows.size() >= size ? encodeCursor(page + 1) : null;
+        return PagedResponse.of(rows, next);
+    }
+
+    private JsonNode firstArray(JsonNode node, String... fields) {
+        for (String field : fields) {
+            JsonNode value = node.get(field);
+            if (value != null && value.isArray()) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private Map<String, Object> toPublic(ApiKey key) {

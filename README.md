@@ -62,7 +62,7 @@ boot — `ddl-auto=validate` will refuse to start otherwise, which is the point.
 mvn test
 ```
 
-210 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
+230 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
 must be running. The schema comes from `src/test/resources/db/schema-test.sql`, a trimmed transcript of
 the real migrations, and the entities are validated against it exactly as they are in production.
 
@@ -174,7 +174,7 @@ own counters.
 | POST | `/v1/uploads/csv` (multipart, streamed) | API key | `campaigns:write` |
 | GET | `/v1/media/{messageId}` → 302 | API key | `media:read` |
 | GET | `/v1/webhooks/events` | API key | `webhooks:manage` |
-| various | `/v1/partner/**` — the console: customers, setup links, keys, webhooks, usage, campaigns | **tenant JWT** (OWNER/ADMIN of a partner) | — |
+| various | `/v1/partner/**` — the console: customers, setup links, keys, webhooks, usage, campaigns (incl. the merged cross-client list and `/campaigns/{id}/recipients`) | **tenant JWT** (OWNER/ADMIN of a partner) | — |
 | GET | `/actuator/health` · `/docs` · `/v3/api-docs` | public | — |
 
 ## Deploying
@@ -197,3 +197,12 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
   endpoint this build needed that `internal.md` lacks.
 - **`app_access` is stored and reported but nothing acts on it** — the branded client login is a later
   phase of the partner epic.
+- **Two internal endpoints this build calls are not in `internal.md`**: `GET
+  /internal/v1/tenants/{id}/settings` (only the PATCH is documented) and `GET
+  /internal/v1/campaigns/across`. Both are implemented against the paths the hand-off named and read
+  defensively, and `minDaysBetweenMarketing` degrades to `0` if the GET is missing — but the shapes are
+  assumptions until `internal.md` catches up.
+- **`GET /v1/partner/campaigns/{id}/recipients` without `customerId` costs a lookup per customer.** There
+  is no cross-tenant campaign read, so the owner is found by asking each of the partner's tenants in
+  turn. The console passes `customerId` from the row it was already showing; the fallback is for a pasted
+  id. A partner with hundreds of customers should not rely on it.

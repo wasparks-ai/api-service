@@ -5,13 +5,16 @@ import com.wasparks.api.auth.ApiKeyService;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.PartnerPrincipal;
 import com.wasparks.api.auth.TenantUserPrincipal;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasparks.api.entity.ApiKey;
+import com.wasparks.api.entity.ApiPartnerTenant;
 import com.wasparks.api.enums.ApiKeyMode;
 import com.wasparks.api.enums.ApiKeyStatus;
 import com.wasparks.api.enums.Scope;
 import com.wasparks.api.error.ApiErrorCode;
 import com.wasparks.api.error.ApiException;
 import com.wasparks.api.internal.AdminInternalClient;
+import com.wasparks.api.internal.InternalTenantsClient;
 import com.wasparks.api.internal.UpstreamRejectedException;
 import com.wasparks.api.internal.UpstreamUnavailableException;
 import com.wasparks.api.plans.EffectiveLimits;
@@ -20,10 +23,12 @@ import com.wasparks.api.quota.QuotaService;
 import com.wasparks.api.repository.ApiKeyRepository;
 import com.wasparks.api.repository.ApiPartnerTenantRepository;
 import com.wasparks.api.repository.ApiUsageDailyRepository;
+import com.wasparks.api.repository.TenantRefRepository;
 import com.wasparks.api.entity.ApiUsageDaily;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.util.MultiValueMap;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -67,10 +72,13 @@ public class PartnerConsoleService {
     private static final Duration ACTOR_CACHE_TTL = Duration.ofMinutes(45);
 
     private final AdminInternalClient adminClient;
+    private final InternalTenantsClient tenantsClient;
     private final ApiKeyService apiKeyService;
     private final ApiKeyRepository apiKeyRepository;
     private final ApiPartnerTenantRepository partnerTenantRepository;
     private final ApiUsageDailyRepository usageRepository;
+    private final TenantRefRepository tenantRefRepository;
+    private final ObjectMapper objectMapper;
     private final PlanResolver planResolver;
     private final QuotaService quotaService;
     private final StringRedisTemplate redis;
@@ -247,6 +255,169 @@ public class PartnerConsoleService {
         body.put("totals", Map.of("messagesAccepted", totalAccepted, "requests", totalRequests));
         body.put("clients", clients);
         return body;
+    }
+
+    // ------------------------------------------------------------------ campaigns across clients
+
+    /** {@code customerId=self} selects the partner's own tenant rather than one of its clients. */
+    public static final String SELF = "self";
+
+    /**
+     * Campaigns across the partner's own tenant and every ACTIVE client, in one call (§B6).
+     *
+     * <p>Read-only, and for support rather than for operating: a partner builds its own campaign UI, but
+     * when one of its customers asks "did that go out?", somebody needs to be able to see the answer
+     * without asking the partner to log in as them.
+     *
+     * <p>A <b>SUSPENDED</b> client is left out. Its campaigns are not running and cannot be started, and
+     * a list that mixed them in would show a partner rows it can do nothing about — the client is still
+     * visible under {@code /v1/partner/customers}, which is where lifting the suspension happens.
+     *
+     * <p>Each row is decorated here with {@code customerId} and {@code customerName}, because upstream
+     * knows a tenant id and this service knows what the partner calls that tenant — the name in the
+     * console has to be the one the partner typed, not the tenant's company name.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> campaignsAcross(Console console, MultiValueMap<String, String> query) {
+        Map<UUID, String> names = new LinkedHashMap<>();
+        UUID ownerTenantId = console.principal().partner().ownerTenantId();
+        names.put(ownerTenantId, partnerName(console));
+
+        for (ApiPartnerTenant link : partnerTenantRepository.findByPartnerIdOrderByCreatedAtDesc(
+                console.partnerId())) {
+            if (link.isActive()) {
+                names.put(link.getTenantId(), customerName(link));
+            }
+        }
+
+        JsonNode page = upstreamNode(() -> tenantsClient.campaignsAcross(ownerTenantId,
+                console.principal().keyId(), List.copyOf(names.keySet()), query));
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (JsonNode campaign : campaignRows(page)) {
+            Map<String, Object> row = objectMapper.convertValue(campaign, LinkedHashMap.class);
+            UUID rowTenantId = uuid(campaign, "tenantId");
+            row.put("customerId", rowTenantId == null ? null
+                    : (rowTenantId.equals(ownerTenantId) ? SELF : rowTenantId.toString()));
+            row.put("customerName", names.get(rowTenantId));
+            rows.add(row);
+        }
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("data", rows);
+        body.put("meta", Map.of("customerCount", names.size()));
+        return body;
+    }
+
+    /**
+     * The tenant a console request should act on: one named client, the partner's own tenant for
+     * {@code self}, or null when the caller named nothing.
+     *
+     * <p>{@code self} exists because a partner's own tenant id is not one of its {@code customerId}s —
+     * it has no {@code api_partner_tenants} row — so there would otherwise be no value a caller could
+     * pass to mean "my own campaigns" once the default became "everyone's".
+     */
+    public UUID resolveCustomerSelector(Console console, String customerId) {
+        if (customerId == null || customerId.isBlank()) {
+            return null;
+        }
+        if (SELF.equalsIgnoreCase(customerId.trim())) {
+            return console.principal().partner().ownerTenantId();
+        }
+        try {
+            return UUID.fromString(customerId.trim());
+        } catch (IllegalArgumentException e) {
+            throw ApiException.of(ApiErrorCode.VALIDATION_FAILED,
+                    "`customerId` must be a customer id, or `self` for your own account.");
+        }
+    }
+
+    /**
+     * Find which of the partner's tenants owns a campaign, and return a principal aimed at it.
+     *
+     * <p>Used only when the caller did not say. There is no cross-tenant campaign lookup on the internal
+     * surface — every read is scoped by {@code X-Tenant-Id}, which is exactly the property that keeps one
+     * partner out of another's data — so "whose is this?" is answered by asking, starting with the
+     * partner's own tenant and then each ACTIVE client until one says yes.
+     *
+     * <p>That is a lookup per customer in the worst case, which is why the console passes
+     * {@code customerId} from the row it was already showing and this path exists for a pasted id. A
+     * campaign belonging to nobody the partner owns is a {@code 404} — the same answer as one that does
+     * not exist, for the same reason every other cross-tenant probe gets one.
+     */
+    @Transactional(readOnly = true)
+    public ApiPrincipal findCampaignOwner(Console console, String campaignId) {
+        UUID ownerTenantId = console.principal().partner().ownerTenantId();
+        if (campaignExists(ownerTenantId, console.principal().keyId(), campaignId)) {
+            return console.principal();
+        }
+        for (ApiPartnerTenant link : partnerTenantRepository.findByPartnerIdOrderByCreatedAtDesc(
+                console.partnerId())) {
+            if (link.isActive()
+                    && campaignExists(link.getTenantId(), console.principal().keyId(), campaignId)) {
+                return console.principal().actingAs(new PartnerPrincipal(console.partnerId(),
+                        ownerTenantId, link.getTenantId(), link.getMessagesPerDayCap()));
+            }
+        }
+        throw ApiException.of(ApiErrorCode.NOT_FOUND, "No campaign with that id.");
+    }
+
+    private boolean campaignExists(UUID tenantId, UUID apiKeyId, String campaignId) {
+        try {
+            tenantsClient.getCampaign(tenantId, apiKeyId, campaignId);
+            return true;
+        } catch (UpstreamRejectedException rejected) {
+            if (rejected.getStatus() == 404) {
+                return false;
+            }
+            throw rejected.toApiException();
+        } catch (UpstreamUnavailableException unavailable) {
+            throw ApiException.of(ApiErrorCode.UPSTREAM_UNAVAILABLE);
+        }
+    }
+
+    /** Upstream's list shape, read defensively — see {@code campaignsAcross}. */
+    private Iterable<JsonNode> campaignRows(JsonNode page) {
+        if (page == null) {
+            return List.of();
+        }
+        if (page.isArray()) {
+            return page;
+        }
+        for (String field : List.of("content", "data", "campaigns")) {
+            JsonNode rows = page.get(field);
+            if (rows != null && rows.isArray()) {
+                return rows;
+            }
+        }
+        return List.of();
+    }
+
+    private String partnerName(Console console) {
+        JsonNode partner = console.partner();
+        if (partner != null && partner.hasNonNull("name")) {
+            return partner.get("name").asText();
+        }
+        return "Your account";
+    }
+
+    private String customerName(ApiPartnerTenant link) {
+        if (link.getDisplayName() != null && !link.getDisplayName().isBlank()) {
+            return link.getDisplayName();
+        }
+        return tenantRefRepository.findById(link.getTenantId())
+                .map(com.wasparks.api.entity.TenantRef::getCompanyName)
+                .orElse("");
+    }
+
+    private <T> T upstreamNode(java.util.function.Supplier<T> call) {
+        try {
+            return call.get();
+        } catch (UpstreamRejectedException rejected) {
+            throw rejected.toApiException();
+        } catch (UpstreamUnavailableException unavailable) {
+            throw ApiException.of(ApiErrorCode.UPSTREAM_UNAVAILABLE);
+        }
     }
 
     /**
