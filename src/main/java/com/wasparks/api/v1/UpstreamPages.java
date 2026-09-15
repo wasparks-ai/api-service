@@ -34,8 +34,13 @@ import java.util.Map;
  */
 public final class UpstreamPages {
 
-    /** The field names upstream has used for the rows, in the order they are looked for. */
-    private static final List<String> ROW_FIELDS = List.of("content", "data", "items");
+    /**
+     * The field names upstream has used for the rows, in the order they are looked for.
+     *
+     * <p>{@code content} is Spring's paged shape, which most of the internal surface returns;
+     * {@code items} is the keyset list ({@code /internal/v1/campaigns/across}).
+     */
+    private static final List<String> ROW_FIELDS = List.of("content", "items", "data");
 
     private UpstreamPages() {
     }
@@ -93,6 +98,36 @@ public final class UpstreamPages {
 
         Map<String, Object> meta = new LinkedHashMap<>(extraMeta);
         if (next != null) {
+            meta.put("next_cursor", next);
+        }
+        return new PagedResponse<>(rows, meta.isEmpty() ? Map.of() : meta);
+    }
+
+    /**
+     * The envelope for an upstream list that already pages by <b>keyset</b>, whose cursor is passed
+     * through in both directions rather than being re-encoded here.
+     *
+     * <p>{@code /internal/v1/campaigns/across} is the only one today. Its cursor is a
+     * {@code created_at|id} pair, its rows are under {@code items}, and it says plainly whether there is
+     * more ({@code nextCursor} null on the last page, plus {@code hasMore}) — so none of the inference
+     * the offset variant has to do applies, and doing it anyway would be inventing an answer next to a
+     * correct one.
+     *
+     * <p>{@code rows} is taken as a parameter rather than read from the body because the caller decorates
+     * each row before it goes out; the cursor and the "is there more" question still come from upstream.
+     */
+    public static PagedResponse<Object> keysetEnvelope(List<Object> rows, JsonNode upstream,
+                                                       Map<String, Object> extraMeta) {
+        Map<String, Object> meta = new LinkedHashMap<>(extraMeta);
+        String next = upstream != null && upstream.hasNonNull("nextCursor")
+                ? upstream.get("nextCursor").asText()
+                : null;
+        // hasMore is upstream's own answer and wins; nextCursor being null IS the end of the walk, so a
+        // hasMore of true with no cursor would be a contradiction we should not paper over by guessing.
+        boolean hasMore = upstream != null && upstream.hasNonNull("hasMore")
+                ? upstream.get("hasMore").asBoolean()
+                : next != null;
+        if (hasMore && next != null && !next.isBlank()) {
             meta.put("next_cursor", next);
         }
         return new PagedResponse<>(rows, meta.isEmpty() ? Map.of() : meta);
