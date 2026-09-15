@@ -38,7 +38,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code /v1/media/{messageId}} are single resources, where upstream's object <em>is</em> the resource
  * and there is no envelope to leak.
  *
- * <p>That rule over-fires on a handful of <b>singleton</b> resources — {@code /v1/account} is one
+ * <p>There are no pass-through exemptions. {@code GET /v1/templates} was one until 2026-09-16 — it
+ * had shipped in P1 returning upstream's shape and normalising it was a breaking change — and it was
+ * normalised deliberately rather than left as a permanent hole in the rule. Nothing on {@code /v1}
+ * answers a collection read in anyone else's contract now.
+ *
+ * <p>The path rule over-fires on a handful of <b>singleton</b> resources — {@code /v1/account} is one
  * composite object, not a list of anything — so those are named below, each with the reason it is not a
  * collection. The list is short, stable, and has to be added to deliberately, which is the point: the
  * next person who adds a raw pass-through has to justify it here rather than discover it later.
@@ -75,19 +80,6 @@ class ListEnvelopeContractTest {
             // The fixed event vocabulary the picker is built from. It has no pages and never will.
             "WebhooksController#events");
 
-    /**
-     * The one collection read that is allowed to return upstream's shape, because changing it now would
-     * break clients that are already using it.
-     *
-     * <p>{@code GET /v1/templates} shipped in P1 and has been live since 2026-09-15 returning
-     * tenants-service's paged shape. It has the same leak as the five this change fixed, and unlike them
-     * it is not a new endpoint — normalising it is a breaking change to a public contract and therefore
-     * somebody's decision, not a tidy-up. It is named here so the exception is visible rather than
-     * absent, and so that this test goes green on the day it is fixed by deleting one line.
-     */
-    private static final Set<String> SHIPPED_BEFORE_THE_ENVELOPE_RULE = Set.of(
-            "TemplatesController#list");
-
     @Test
     @DisplayName("every collection read on /v1 declares the PagedResponse envelope")
     void collectionsReturnTheEnvelope() {
@@ -101,8 +93,7 @@ class ListEnvelopeContractTest {
                     continue;
                 }
                 String name = controller.getSimpleName() + "#" + method.getName();
-                if (SINGLETON_RESOURCES.contains(name)
-                        || SHIPPED_BEFORE_THE_ENVELOPE_RULE.contains(name)) {
+                if (SINGLETON_RESOURCES.contains(name)) {
                     continue;
                 }
                 collections++;
@@ -134,8 +125,7 @@ class ListEnvelopeContractTest {
                     continue;
                 }
                 String name = controller.getSimpleName() + "#" + method.getName();
-                if (SINGLETON_RESOURCES.contains(name)
-                        || SHIPPED_BEFORE_THE_ENVELOPE_RULE.contains(name)) {
+                if (SINGLETON_RESOURCES.contains(name)) {
                     continue;
                 }
                 // Stated separately from the check above because it is the failure that actually
@@ -150,7 +140,7 @@ class ListEnvelopeContractTest {
     }
 
     @Test
-    @DisplayName("the exemption lists name handlers that still exist")
+    @DisplayName("the exemption list names handlers that still exist")
     void exemptionsAreReal() {
         List<String> known = new ArrayList<>();
         for (Class<?> controller : V1_CONTROLLERS) {
@@ -161,9 +151,6 @@ class ListEnvelopeContractTest {
         // An exemption for a handler that has been renamed or deleted is an exemption nobody is
         // watching — and the next handler to take that name inherits it silently.
         for (String exempt : SINGLETON_RESOURCES) {
-            assertTrue(known.contains(exempt), "stale exemption: " + exempt);
-        }
-        for (String exempt : SHIPPED_BEFORE_THE_ENVELOPE_RULE) {
             assertTrue(known.contains(exempt), "stale exemption: " + exempt);
         }
         assertFalse(known.isEmpty());

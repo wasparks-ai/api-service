@@ -184,6 +184,40 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
 `developer.wasparks.com` here and `developers.wasparks.com` to `/docs`, and — belt and braces —
 `api.wasparks.com` must keep `location /internal/ { return 404; }`.
 
+## Changelog
+
+### 2026-09-16 — `GET /v1/templates` answers in the house envelope · **breaking**
+
+Every collection read on `/v1` now returns `{data, meta}` and pages with `cursor`/`limit`.
+`GET /v1/templates` was the last one that did not: it shipped in P1 handing tenants-service's paged
+shape straight through, which meant clients were parsing our upstream's contract rather than ours.
+
+**Before**
+
+```json
+{ "content": [ { "id": "…", "name": "order_update" } ],
+  "number": 0, "size": 25, "totalElements": 61, "totalPages": 3, "last": false }
+```
+`GET /v1/templates?page=1&size=25`
+
+**After**
+
+```json
+{ "data": [ { "id": "…", "name": "order_update" } ],
+  "meta": { "next_cursor": "MQ" } }
+```
+`GET /v1/templates?cursor=MQ&limit=25`
+
+**To migrate:** read `data` instead of `content`, and walk by passing the previous response's
+`meta.next_cursor` back as `?cursor=` until it is absent, instead of incrementing `page`. `size`
+becomes `limit` (same default of 25, same maximum of 100). The cursor is opaque — do not construct
+one; a value we did not issue is rejected rather than silently restarting the walk.
+
+`totalElements` has no replacement. It was never part of the documented contract, and the envelope
+does not promise a count because the underlying reads cannot produce one cheaply on every path.
+
+Nothing else about the endpoint changed: the same filters, the same rows, the same scope.
+
 ## Known gaps
 
 - **Webhook auto-pause does not email the tenant** (epic §B8). An endpoint paused after 100 consecutive
@@ -197,10 +231,6 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
   endpoint this build needed that `internal.md` lacks.
 - **`app_access` is stored and reported but nothing acts on it** — the branded client login is a later
   phase of the partner epic.
-- **`GET /v1/templates` still returns tenants-service's paged shape**, not the `{data, meta}`
-  envelope every other collection read answers in. It shipped that way in P1 and is live, so
-  normalising it is a breaking change somebody has to decide on rather than a tidy-up;
-  `ListEnvelopeContractTest` names it as the one exemption so the gap is visible instead of absent.
 - **Two internal endpoints this build calls are not in `internal.md`**: `GET
   /internal/v1/tenants/{id}/settings` (only the PATCH is documented) and `GET
   /internal/v1/campaigns/across`. Both are implemented against the paths the hand-off named and read

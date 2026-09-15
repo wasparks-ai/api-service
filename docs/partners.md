@@ -300,10 +300,6 @@ The cursor is opaque. Do not parse it, construct one, or do arithmetic on it —
 and one you build yourself is rejected rather than silently restarting the walk you thought you were
 continuing.
 
-> `GET /v1/templates` is the one exception: it still returns the underlying paged shape
-> (`content`, `totalElements`) and takes `page`/`size`. It predates this envelope and is not being
-> changed under clients already using it.
-
 ---
 
 ## Limits
