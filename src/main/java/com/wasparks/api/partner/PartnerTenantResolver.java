@@ -1,5 +1,6 @@
 package com.wasparks.api.partner;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.PartnerPrincipal;
 import com.wasparks.api.entity.ApiPartner;
@@ -7,6 +8,8 @@ import com.wasparks.api.entity.ApiPartnerTenant;
 import com.wasparks.api.error.ApiErrorCode;
 import com.wasparks.api.error.ApiException;
 import com.wasparks.api.repository.ApiPartnerRepository;
+import com.wasparks.api.plans.EffectiveLimits;
+import com.wasparks.api.plans.PlanResolver;
 import com.wasparks.api.repository.ApiPartnerTenantRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -54,6 +57,15 @@ import java.util.UUID;
  * alone. A miss therefore falls through to the database rather than being answered as a 404 — the
  * suspended case needs its own status code, and inventing it from an absence would give a partner a 404
  * for a customer it can plainly see in its own console.
+ *
+ * <h2>Client keys</h2>
+ * A key a partner issued for one of its customers has no {@code partner_id} and sends no
+ * {@code X-Tenant-Id} — it is an ordinary key on an ordinary tenant. It still runs in the partner's
+ * context, because the customer draws on the partner's pooled allowance and sits under the cap the
+ * partner set for it; only the credential differs. That is resolved here too, from a second cache at
+ * {@code partner:client:{tenantId}} which holds the whole answer (partner, owner, cap, status, pool
+ * limits) or the literal {@code none} for the overwhelming majority of tenants that are nobody's
+ * customer.
  */
 @Service
 @RequiredArgsConstructor
@@ -72,9 +84,14 @@ public class PartnerTenantResolver {
     private static final String NO_CAP = "";
     private static final String EMPTY_MARKER = "none";
 
+    /** Cached at {@code partner:client:{tenantId}} when a tenant is nobody's customer. */
+    private static final String NOT_A_CLIENT = "none";
+
     private final ApiPartnerRepository partnerRepository;
     private final ApiPartnerTenantRepository partnerTenantRepository;
+    private final PlanResolver planResolver;
     private final StringRedisTemplate redis;
+    private final ObjectMapper objectMapper;
 
     @Value("${app.partner.tenant-cache-ttl-seconds}")
     private long cacheTtlSeconds;
@@ -90,7 +107,10 @@ public class PartnerTenantResolver {
     @Transactional(readOnly = true)
     public ApiPrincipal resolve(ApiPrincipal principal, String tenantIdHeader) {
         if (principal.partnerId() == null) {
-            return principal;
+            // Not a partner key — but it may still be a CLIENT key, issued by a partner for one of its
+            // customers. Those run in the partner's context too (§B1), so the header is irrelevant and
+            // the key's own tenant is the acting one.
+            return clientContext(principal);
         }
 
         ApiPartner partner = partnerRepository.findById(principal.partnerId())
@@ -110,6 +130,41 @@ public class PartnerTenantResolver {
         Integer cap = acting.equals(ownerTenantId) ? null : requireActiveClient(partner.getId(), acting);
         return principal.actingAs(
                 new PartnerPrincipal(partner.getId(), ownerTenantId, acting, cap));
+    }
+
+    /**
+     * Put an ordinary key into its partner's context, if its tenant is a partner's customer.
+     *
+     * <p>A client key is a plain {@code wsk_live_} key with no {@code partner_id} — that is the whole
+     * point of it, and it stays true of the row. What changes is what it spends: the customer draws on
+     * its partner's pooled allowance and is subject to the cap the partner set for it, exactly as if the
+     * partner had acted for it with {@code X-Tenant-Id}. Without this, a client key ran on the customer's
+     * own plan, and since a partner-provisioned tenant has no assignment that meant the default plan's
+     * limits — a customer quietly capped at 200 messages a day while its partner had 20,000 unspent.
+     *
+     * <p><b>An explicit plan assignment wins.</b> If an admin has deliberately put a client tenant on a
+     * plan of its own, that is a decision about that tenant and it keeps its plan and its own counters.
+     * Only a client with no assignment pools.
+     *
+     * <p>A key belonging to a tenant that is nobody's customer is returned untouched, which is almost
+     * every key in the estate — so the negative answer is cached as aggressively as the positive one.
+     */
+    private ApiPrincipal clientContext(ApiPrincipal principal) {
+        ClientContext context = clientContext(principal.tenantId());
+        if (context == null) {
+            return principal;
+        }
+        if (context.suspended()) {
+            // The same rule the X-Tenant-Id path applies. A partner that suspends a customer expects it
+            // to stop sending, and a credential the partner itself issued is not an exception.
+            throw ApiException.of(ApiErrorCode.CUSTOMER_SUSPENDED,
+                            "This customer is suspended. Re-activate it before sending on its behalf.")
+                    .withDetail("customerId", principal.tenantId().toString());
+        }
+        return principal.actingAs(
+                new PartnerPrincipal(context.partnerId(), context.ownerTenantId(),
+                        principal.tenantId(), context.cap()),
+                context.limits());
     }
 
     /**
@@ -190,6 +245,99 @@ public class PartnerTenantResolver {
                     e.getMessage());
             return Cached.MISS;
         }
+    }
+
+    // ------------------------------------------------------------------ the client-key context
+
+    /**
+     * Everything a client key needs to run in its partner's context, or null when its tenant is nobody's
+     * customer.
+     *
+     * <p>Cached whole, including the resolved pool limits, at {@code partner:client:{tenantId}} — and the
+     * <b>negative</b> answer is cached too, as the literal {@code none}, because almost every key in the
+     * estate belongs to an ordinary tenant and that lookup would otherwise be a database round trip on
+     * every request they make.
+     *
+     * <p>Caching the limits as well is what keeps this cheap: a client key's acting tenant never varies
+     * per request (unlike a partner key's), so the whole answer is stable and one Redis GET replaces a
+     * link lookup, a partner lookup, an assignment check and a plan resolve. It is invalidated eagerly
+     * whenever the cap or status moves; only an out-of-band plan change lags, by the same 60 seconds
+     * everything else here does.
+     */
+    private ClientContext clientContext(UUID tenantId) {
+        String cacheKey = clientCacheKey(tenantId);
+        try {
+            String cached = redis.opsForValue().get(cacheKey);
+            if (NOT_A_CLIENT.equals(cached)) {
+                return null;
+            }
+            if (cached != null) {
+                return objectMapper.readValue(cached, ClientContext.class);
+            }
+        } catch (Exception e) {
+            // Unreadable (an older shape) or unreachable. Fall through to the database, as everywhere.
+            log.debug("Client context cache unusable for {}: {}", tenantId, e.getMessage());
+        }
+
+        ClientContext resolved = loadClientContext(tenantId);
+        try {
+            redis.opsForValue().set(cacheKey,
+                    resolved == null ? NOT_A_CLIENT : objectMapper.writeValueAsString(resolved),
+                    Duration.ofSeconds(cacheTtlSeconds));
+        } catch (Exception e) {
+            log.debug("Could not cache the client context for {}: {}", tenantId, e.getMessage());
+        }
+        return resolved;
+    }
+
+    private ClientContext loadClientContext(UUID tenantId) {
+        List<UUID> partnerIds = partnerTenantRepository.findPartnerIdsByTenantId(tenantId);
+        if (partnerIds.isEmpty()) {
+            return null;
+        }
+        ApiPartnerTenant link = partnerTenantRepository
+                .findByPartnerIdAndTenantId(partnerIds.get(0), tenantId).orElse(null);
+        if (link == null) {
+            return null;
+        }
+        ApiPartner partner = partnerRepository.findById(link.getPartnerId()).orElse(null);
+        if (partner == null || partner.getOwnerTenantId() == null) {
+            // A client whose partner row has gone. Nothing to pool against, so it behaves as the
+            // ordinary tenant it otherwise is rather than failing every request.
+            log.warn("Tenant {} is linked to partner {} with no usable partner row", tenantId,
+                    link.getPartnerId());
+            return null;
+        }
+        // An explicit assignment is a decision about this tenant; it keeps its own plan and counters.
+        if (planResolver.resolveExplicit(tenantId).isPresent()) {
+            return null;
+        }
+        return new ClientContext(link.getPartnerId(), partner.getOwnerTenantId(),
+                link.getMessagesPerDayCap(), !link.isActive(),
+                planResolver.resolve(partner.getOwnerTenantId()));
+    }
+
+    /**
+     * Drop one client's cached context. Called wherever the forward hash is invalidated, because the cap
+     * and the status live in both and must not disagree.
+     */
+    public void invalidateClient(UUID tenantId) {
+        try {
+            redis.delete(clientCacheKey(tenantId));
+        } catch (Exception e) {
+            log.warn("Could not invalidate the client context cache for {}: {}", tenantId,
+                    e.getMessage());
+        }
+    }
+
+    /** The partner context a client key runs in. A record, so it round-trips through Redis as JSON. */
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
+    record ClientContext(UUID partnerId, UUID ownerTenantId, Integer cap, boolean suspended,
+                         EffectiveLimits limits) {
+    }
+
+    static String clientCacheKey(UUID tenantId) {
+        return CACHE_PREFIX + "client:" + tenantId;
     }
 
     /** Load the partner's ACTIVE clients and their caps into the hash. */

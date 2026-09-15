@@ -4,6 +4,8 @@ import com.wasparks.api.BaseIntegrationTest;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.PartnerPrincipal;
 import com.wasparks.api.enums.ApiKeyMode;
+import com.wasparks.api.error.ApiErrorCode;
+import com.wasparks.api.error.ApiException;
 import com.wasparks.api.plans.EffectiveLimits;
 import com.wasparks.api.plans.PlanResolver;
 import com.wasparks.api.quota.QuotaService;
@@ -15,6 +17,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Pool versus cap (§0.9, §B1): a partner key must satisfy <b>both</b> its client's daily ceiling and the
@@ -30,6 +33,10 @@ class PartnerQuotaIntegrationTest extends BaseIntegrationTest {
     private QuotaService quotaService;
     @Autowired
     private PlanResolver planResolver;
+    @Autowired
+    private PartnerTenantResolver resolver;
+    @Autowired
+    private PartnerCustomerService customerService;
 
     @Test
     @DisplayName("the client cap binds before the pool does")
@@ -146,6 +153,117 @@ class PartnerQuotaIntegrationTest extends BaseIntegrationTest {
         assertThat(quotaService.peekPool(partnerId).today()).isZero();
     }
 
+    // ------------------------------------------------------------------ client keys
+
+    @Test
+    @DisplayName("a client key draws on its partner's pool, not on the default plan")
+    void clientKeyPools() throws Exception {
+        UUID partnerId = makePartner("leadboard");
+        UUID clientId = addClient(partnerId, "cust_1", null);
+        assignPlanTo(tenantId, "PARTNER_STARTER");
+        String clientKey = apiKeyService.issueForTenant(clientId, null, "client key",
+                ApiKeyMode.LIVE, null, null).plaintext();
+
+        // The client tenant has no plan of its own, so before this it ran on the seeded FREE plan —
+        // 200 messages a day for a customer whose partner had 20,000 unspent.
+        ApiPrincipal resolved = resolver.resolve(apiKeyService.resolve(clientKey), null);
+
+        assertThat(resolved.isPartner()).isTrue();
+        assertThat(resolved.partner().partnerId()).isEqualTo(partnerId);
+        assertThat(resolved.partner().ownerTenantId()).isEqualTo(tenantId);
+        assertThat(resolved.partner().actingTenantId()).isEqualTo(clientId);
+        assertThat(resolved.limits().planCode()).isEqualTo("PARTNER_STARTER");
+
+        // And it spends the pool, exactly as the X-Tenant-Id path does.
+        assertThat(quotaService.reserve(resolved, 5).allowed()).isTrue();
+        assertThat(quotaService.peekPool(partnerId).today()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("a client key is still bound by the cap its partner set")
+    void clientKeyRespectsTheCap() throws Exception {
+        UUID partnerId = makePartner("leadboard");
+        UUID clientId = addClient(partnerId, "cust_1", 3);
+        assignPlanTo(tenantId, "PARTNER_STARTER");
+        String clientKey = apiKeyService.issueForTenant(clientId, null, "client key",
+                ApiKeyMode.LIVE, null, null).plaintext();
+
+        ApiPrincipal resolved = resolver.resolve(apiKeyService.resolve(clientKey), null);
+        assertThat(resolved.partner().clientDailyCap()).isEqualTo(3);
+
+        QuotaService.Decision decision = quotaService.reserve(resolved, 4);
+        assertThat(decision.allowed()).isFalse();
+        assertThat(decision.scope()).isEqualTo("client");
+    }
+
+    @Test
+    @DisplayName("a client tenant with an explicitly assigned plan keeps its own plan")
+    void explicitPlanWins() throws Exception {
+        UUID partnerId = makePartner("leadboard");
+        UUID clientId = addClient(partnerId, "cust_1", null);
+        assignPlanTo(tenantId, "PARTNER_STARTER");
+        // An admin has deliberately put this customer on a plan. That is a decision about this tenant,
+        // and pooling it would silently overrule the admin who made it.
+        assignPlanTo(clientId, "BUSINESS");
+
+        String clientKey = apiKeyService.issueForTenant(clientId, null, "client key",
+                ApiKeyMode.LIVE, null, null).plaintext();
+        ApiPrincipal resolved = resolver.resolve(apiKeyService.resolve(clientKey), null);
+
+        assertThat(resolved.isPartner()).isFalse();
+        assertThat(resolved.limits().planCode()).isEqualTo("BUSINESS");
+
+        quotaService.reserve(resolved, 5);
+        assertThat(quotaService.peek(clientId).today()).isEqualTo(5);
+        assertThat(quotaService.peekPool(partnerId).today()).isZero();
+    }
+
+    @Test
+    @DisplayName("a client key for a suspended customer is refused like any other credential")
+    void clientKeyOfSuspendedCustomer() throws Exception {
+        UUID partnerId = makePartner("leadboard");
+        UUID clientId = addClient(partnerId, "cust_1", null, "SUSPENDED");
+        String clientKey = apiKeyService.issueForTenant(clientId, null, "client key",
+                ApiKeyMode.LIVE, null, null).plaintext();
+
+        ApiPrincipal base = apiKeyService.resolve(clientKey);
+        assertThatThrownBy(() -> resolver.resolve(base, null))
+                .isInstanceOf(ApiException.class)
+                .satisfies(thrown -> assertThat(((ApiException) thrown).getCode())
+                        .isEqualTo(ApiErrorCode.CUSTOMER_SUSPENDED));
+    }
+
+    @Test
+    @DisplayName("a key on a tenant that is nobody's customer is left exactly as it was")
+    void ordinaryTenantKeyIsUntouched() throws Exception {
+        String key = issueLiveKey();
+        ApiPrincipal resolved = resolver.resolve(apiKeyService.resolve(key), null);
+
+        assertThat(resolved.isPartner()).isFalse();
+        assertThat(resolved.tenantId()).isEqualTo(tenantId);
+    }
+
+    @Test
+    @DisplayName("a cap change invalidates the client-key context, not just the partner hash")
+    void capChangeInvalidatesTheClientContext() throws Exception {
+        UUID partnerId = makePartner("leadboard");
+        UUID clientId = addClient(partnerId, "cust_1", 3);
+        assignPlanTo(tenantId, "PARTNER_STARTER");
+        String clientKey = apiKeyService.issueForTenant(clientId, null, "client key",
+                ApiKeyMode.LIVE, null, null).plaintext();
+
+        assertThat(resolver.resolve(apiKeyService.resolve(clientKey), null)
+                .partner().clientDailyCap()).isEqualTo(3);
+
+        customerService.update(partnerPrincipalForOwner(partnerId), clientId,
+                new PartnerCustomerService.UpdateRequest(null, 50, null, null));
+
+        // Without invalidateClient this would still read 3 for the rest of the minute, and the console
+        // would be showing a cap the customer's own key was not getting.
+        assertThat(resolver.resolve(apiKeyService.resolve(clientKey), null)
+                .partner().clientDailyCap()).isEqualTo(50);
+    }
+
     @Test
     @DisplayName("an ordinary tenant key still uses the P1 tenant counters")
     void tenantKeysAreUnchanged() {
@@ -171,6 +289,12 @@ class PartnerQuotaIntegrationTest extends BaseIntegrationTest {
     }
 
     // ------------------------------------------------------------------ fixtures
+
+    /** A partner principal acting on its own tenant — what the console's writes run as. */
+    private ApiPrincipal partnerPrincipalForOwner(UUID partnerId) {
+        return new ApiPrincipal(UUID.randomUUID(), tenantId, partnerId, ApiKeyMode.LIVE, Set.of(),
+                limits(1000, 100000), new PartnerPrincipal(partnerId, tenantId, tenantId, null));
+    }
 
     private ApiPrincipal partnerPrincipal(UUID partnerId, UUID clientId, Integer cap,
                                           int messagesPerDay, int messagesPerMonth) {

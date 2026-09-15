@@ -196,9 +196,12 @@ public class PartnerCustomerService {
         }
 
         ApiPartnerTenant saved = partnerTenantRepository.save(link);
-        // Status and cap both change what the resolver hands the quota check, so the cached hash is
-        // stale the moment either moves.
+        // Status and cap both change what the resolver hands the quota check, so both caches holding
+        // them are stale the moment either moves: the partner's membership hash (the X-Tenant-Id path)
+        // and this customer's own client-key context. Dropping only one would leave a client key
+        // sending against a cap the console says it no longer has.
         partnerTenantResolver.invalidate(link.getPartnerId());
+        partnerTenantResolver.invalidateClient(link.getTenantId());
         return toPublic(saved);
     }
 

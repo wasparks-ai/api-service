@@ -59,7 +59,19 @@ public record ApiPrincipal(
 
     /** The same principal acting on {@code actingTenantId} instead of the key's own tenant. */
     public ApiPrincipal actingAs(PartnerPrincipal resolved) {
-        return new ApiPrincipal(keyId, resolved.actingTenantId(), partnerId, mode, scopes, limits,
+        return actingAs(resolved, limits);
+    }
+
+    /**
+     * As {@link #actingAs(PartnerPrincipal)}, but on somebody else's plan.
+     *
+     * <p>For a <b>client key</b> belonging to a partner's customer (§B1): the key is an ordinary
+     * {@code wsk_live_} key filed under the customer's tenant, but the allowance it spends is the
+     * partner's pool, which lives on the partner's own tenant. {@code partnerId} stays null because the
+     * key row genuinely has none — what changes is the context it runs in, not what the key is.
+     */
+    public ApiPrincipal actingAs(PartnerPrincipal resolved, EffectiveLimits effective) {
+        return new ApiPrincipal(keyId, resolved.actingTenantId(), partnerId, mode, scopes, effective,
                 resolved);
     }
 

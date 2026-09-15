@@ -62,7 +62,7 @@ boot — `ddl-auto=validate` will refuse to start otherwise, which is the point.
 mvn test
 ```
 
-203 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
+210 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
 must be running. The schema comes from `src/test/resources/db/schema-test.sql`, a trimmed transcript of
 the real migrations, and the entities are validated against it exactly as they are in production.
 
@@ -148,6 +148,12 @@ acting tenant in the auth filter, so every later stage — the limiters, the quo
 client — reads one field and cannot be pointed at a customer the key does not hold. That resolution is
 the security boundary of the whole partner surface; see `PartnerTenantResolver`.
 
+A **client key** — one a partner issued for a single customer — goes through the same step. It carries no
+`partner_id` and sends no `X-Tenant-Id`, but its tenant is somebody's customer, so it runs in that
+partner's context: the pooled allowance, the cap the partner set, and the same `403 customer_suspended`.
+The exception is a client tenant an admin has explicitly assigned a plan, which keeps that plan and its
+own counters.
+
 ## Endpoints
 
 | Method | Path | Auth | Scope |
@@ -189,12 +195,5 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
   frequency-guard switch (`PATCH /v1/partner/customers/{id}/settings`) is built against it and starts
   working the moment tenants-service ships it; until then it answers `404`. It is the one internal
   endpoint this build needed that `internal.md` lacks.
-- **A scheduled campaign paused for quota emits two `campaign.paused` events** — upstream's `MANUAL`
-  (pausing is how the runner is stopped) and then ours with `reason: QUOTA`. It goes away when the
-  internal pause endpoint accepts a reason.
-- **A client key runs on the customer's own plan, not the partner's pool** (epic §B2: client keys
-  "behave exactly as P1 keys"). A partner-provisioned tenant has no plan assignment, so in practice that
-  means the default FREE limits. Assign a plan to client tenants, or use a partner key with
-  `X-Tenant-Id`.
 - **`app_access` is stored and reported but nothing acts on it** — the branded client login is a later
   phase of the partner epic.

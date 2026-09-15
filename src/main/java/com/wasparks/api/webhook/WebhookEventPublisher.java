@@ -87,31 +87,6 @@ public class WebhookEventPublisher {
                 payload, Instant.now());
     }
 
-    /**
-     * A scheduled campaign could not start because the partner's allowance was gone (§B3).
-     *
-     * <p>The fourth {@code campaign.paused} reason, and the only one this service originates: the other
-     * three — MANUAL, QUALITY_DROP, TIER_CAP — are the campaign engine's own decisions, while running out
-     * of a partner's pooled allowance is a rule that exists only here.
-     *
-     * <p>Note for anyone reading a partner's event stream: the campaign is also paused <em>upstream</em>,
-     * which is the only way to stop the runner picking it up, and that transition emits its own
-     * {@code campaign.paused} with reason {@code MANUAL} a moment earlier. The pair is deliberate rather
-     * than a bug, and it goes away when tenants-service's internal pause endpoint accepts a reason — see
-     * the hand-off report. The QUOTA event is the one that explains what happened.
-     */
-    @Transactional
-    public ApiOutboxEvent publishCampaignQuotaPaused(UUID tenantId, UUID campaignId,
-                                                     Map<String, Object> campaign, String scope,
-                                                     int limit, int required) {
-        Map<String, Object> payload = new LinkedHashMap<>(campaign);
-        payload.put("status", "PAUSED");
-        payload.put("reason", WebhookEvents.PAUSE_REASON_QUOTA);
-        payload.put("quota", Map.of("scope", scope, "limit", limit, "required", required));
-        return write(tenantId, WebhookEvents.CAMPAIGN_PAUSED, WebhookEvents.AGGREGATE_CAMPAIGN,
-                campaignId, payload, Instant.now());
-    }
-
     /** A WARN-plan tenant went past its quota. Fired at most once a day by {@code QuotaInterceptor}. */
     @Transactional
     public void publishQuotaExceeded(UUID tenantId, String scope, int limit) {

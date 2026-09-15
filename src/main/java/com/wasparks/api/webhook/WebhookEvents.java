@@ -40,9 +40,13 @@ public final class WebhookEvents {
     public static final String PING = "ping";
 
     /**
-     * {@code campaign.paused} reasons. {@code QUOTA} is this service's own (api-partner §B3): the other
-     * three are decided by the campaign engine, while a campaign stopped for running out of the
-     * partner's allowance is stopped by a rule that only lives here.
+     * The fourth {@code campaign.paused} reason (api-partner §B3), alongside the campaign engine's own
+     * MANUAL, QUALITY_DROP and TIER_CAP.
+     *
+     * <p>The decision is this service's — only it knows a partner's pool is empty — but the <b>event</b>
+     * is not: {@code ScheduledCampaignQuotaJob} sends this reason on the internal pause call and
+     * tenants-service emits the single {@code campaign.paused}. Emitting one here as well produced two
+     * events for one transition, the first of them claiming MANUAL.
      */
     public static final String PAUSE_REASON_QUOTA = "QUOTA";
 

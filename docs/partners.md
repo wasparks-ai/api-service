@@ -318,10 +318,6 @@ scheduled campaign comes due, it is **paused** rather than cancelled and you get
 
 Resume it tomorrow with `POST /v1/campaigns/{id}/resume`.
 
-> You may see a `campaign.paused` with `reason: "MANUAL"` immediately before the `QUOTA` one. Pausing the
-> campaign is how we stop it starting, and that transition reports itself. The `QUOTA` event is the one
-> that explains what happened.
-
 ---
 
 ## Webhooks
@@ -408,14 +404,18 @@ a customer unable to send at all is worse than one that over-sends once.
 | | Prefix | Acts on | Draws on |
 |---|---|---|---|
 | **Partner key** | `wsk_partner_live_` | any customer, via `X-Tenant-Id` | your pooled plan |
-| **Client key** | `wsk_live_` | one customer, no header | that customer's own plan |
+| **Client key** | `wsk_live_` | one customer, no header | your pooled plan, and that customer's cap |
 
 Partner keys are created in the Partner console in WaSparks (`Partner → Keys`), never by another key — a
 key that could mint its own replacement would make revoking a leaked one pointless.
 
 Client keys are for handing a customer a credential of its own: `POST /v1/customers/{id}/keys`. They
-behave exactly like an ordinary WaSparks key, which means they run on that customer's own plan rather
-than on your pool. If you want your pooled limits, use your partner key with `X-Tenant-Id`.
+look and behave like an ordinary WaSparks key — no `X-Tenant-Id`, no partner concepts — but they spend
+**your** allowance and respect the cap you set for that customer, so the limits are the same whichever
+credential the traffic arrives on. Suspending a customer stops its own key too.
+
+(If WaSparks has put one of your customers on a plan of its own, that plan wins and the customer stops
+drawing on your pool. That only happens if an administrator arranges it deliberately.)
 
 Both count against **your** key allowance.
 

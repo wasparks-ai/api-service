@@ -237,9 +237,24 @@ public class InternalTenantsClient {
      * has a tenant and a key id but no principal to speak of.
      */
     public JsonNode transitionCampaign(UUID tenantId, UUID apiKeyId, String id, String transition) {
+        return transitionCampaign(tenantId, apiKeyId, id, transition, null);
+    }
+
+    /**
+     * A transition with a body — in practice {@code pause} with {@code {"reason": "QUOTA"}} (§B3).
+     *
+     * <p>The reason goes upstream rather than being reported separately, because the pause and the event
+     * that describes it have to be one fact. When this service emitted its own {@code campaign.paused},
+     * a partner saw two of them for one transition: upstream's {@code MANUAL}, from the pause call that
+     * actually stops the runner, and ours a moment later with the reason that explained it. Now
+     * tenants-service stamps the reason on the transition it is already making and emits the single
+     * event.
+     */
+    public JsonNode transitionCampaign(UUID tenantId, UUID apiKeyId, String id, String transition,
+                                       Object body) {
         return exchange(HttpMethod.POST,
                 uri -> uri.path("/internal/v1/campaigns/{id}/{transition}").build(id, transition),
-                tenantId, apiKeyId, null, JsonNode.class);
+                tenantId, apiKeyId, body, JsonNode.class);
     }
 
     // ------------------------------------------------------------------ audiences (api-partner §B3a)

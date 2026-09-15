@@ -17,6 +17,7 @@ import org.springframework.http.MediaType;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -254,7 +255,7 @@ class CampaignsApiIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
-    @DisplayName("an over-quota scheduled campaign is paused and emits campaign.paused reason QUOTA")
+    @DisplayName("an over-quota scheduled campaign is paused upstream with reason QUOTA")
     void sweepPausesOverQuotaCampaigns() {
         createPlan("CAMPAIGN_TINY_SWEEP", 1000, 10, 1000, "BLOCK", 3);
         assignPlan("CAMPAIGN_TINY_SWEEP", null);
@@ -267,17 +268,31 @@ class CampaignsApiIntegrationTest extends BaseIntegrationTest {
 
         scheduledQuotaJob.sweep();
 
-        // Paused upstream — the only way to stop the runner promoting it — and reported with the fourth
-        // pause reason, which is this service's own.
+        // Pausing upstream is the only thing that stops the runner promoting it, and the reason rides on
+        // that same call so tenants-service can emit one campaign.paused that explains itself.
         Mockito.verify(tenantsClient).transitionCampaign(Mockito.eq(tenantId), Mockito.eq(apiKeyId),
-                Mockito.eq(campaignId.toString()), Mockito.eq("pause"));
+                Mockito.eq(campaignId.toString()), Mockito.eq("pause"),
+                Mockito.eq(Map.of("reason", "QUOTA")));
+    }
 
+    @Test
+    @DisplayName("this service writes no campaign.paused of its own — upstream emits the single event")
+    void sweepEmitsNoEventItself() {
+        createPlan("CAMPAIGN_TINY_EVENT", 1000, 10, 1000, "BLOCK", 3);
+        assignPlan("CAMPAIGN_TINY_EVENT", null);
+        issueLiveKey();
+        UUID apiKeyId = apiKeyRepository.findAll().get(0).getId();
+
+        Mockito.when(tenantsClient.listCampaigns(Mockito.eq(tenantId), Mockito.any(), Mockito.any()))
+                .thenReturn(page(UUID.randomUUID(), apiKeyId,
+                        Instant.now().plus(1, ChronoUnit.MINUTES), 50));
+
+        scheduledQuotaJob.sweep();
+
+        // Emitting one here as well gave a partner two events for one transition, the first of them
+        // claiming MANUAL.
         assertThat(outboxEventRepository.findAll())
-                .anySatisfy(event -> {
-                    assertThat(event.getEventType()).isEqualTo(WebhookEvents.CAMPAIGN_PAUSED);
-                    assertThat(event.getPayload()).containsEntry("reason", "QUOTA");
-                    assertThat(event.getAggregateId()).isEqualTo(campaignId);
-                });
+                .noneMatch(event -> WebhookEvents.CAMPAIGN_PAUSED.equals(event.getEventType()));
     }
 
     @Test

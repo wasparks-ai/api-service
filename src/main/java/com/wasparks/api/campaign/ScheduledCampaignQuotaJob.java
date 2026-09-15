@@ -12,7 +12,7 @@ import com.wasparks.api.quota.QuotaService;
 import com.wasparks.api.repository.ApiKeyRepository;
 import com.wasparks.api.repository.ApiPartnerRepository;
 import com.wasparks.api.repository.ApiPartnerTenantRepository;
-import com.wasparks.api.webhook.WebhookEventPublisher;
+import com.wasparks.api.webhook.WebhookEvents;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
@@ -26,7 +26,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -46,11 +45,11 @@ import java.util.UUID;
  * minutes ahead, checked every minute, is the epic's number and sits comfortably inside both.
  *
  * <h2>When the allowance is gone</h2>
- * The campaign is paused upstream — the only way to stop the runner picking it up — and a
- * {@code campaign.paused} with reason {@code QUOTA} is emitted, which is a fourth reason the picker and
- * the docs now carry. It is not cancelled: an allowance that ran out today is usually there tomorrow,
- * and a partner that has to recreate a 4,000-recipient campaign because we cancelled it has been
- * punished for our scheduling rather than for its own.
+ * The campaign is paused upstream with {@code reason: "QUOTA"} — pausing is the only thing that stops
+ * the runner picking it up, and tenants-service emits the single {@code campaign.paused} carrying that
+ * reason, which is a fourth reason the picker and the docs now carry. It is not cancelled: an allowance
+ * that ran out today is usually there tomorrow, and a partner made to recreate a 4,000-recipient
+ * campaign because we cancelled it has been punished for our scheduling rather than for its own.
  *
  * <p><b>ShedLock, not idempotence.</b> Reserving twice would charge a campaign twice, so this job must
  * run on one replica — and, because a reservation leaves no mark on the campaign row, there is nothing to
@@ -75,7 +74,6 @@ public class ScheduledCampaignQuotaJob {
     private final ApiPartnerRepository partnerRepository;
     private final ApiPartnerTenantRepository partnerTenantRepository;
     private final PlanResolver planResolver;
-    private final WebhookEventPublisher eventPublisher;
 
     @Value("${app.partner.scheduled-quota.lookahead-minutes}")
     private int lookaheadMinutes;
@@ -167,24 +165,34 @@ public class ScheduledCampaignQuotaJob {
         // Out of allowance. Forget the id first: the campaign will still be SCHEDULED if the pause
         // below fails, and the next tick should try again rather than skip it forever.
         reserved.remove(campaignId);
-        pauseForQuota(tenantId, apiKeyId, campaignId, campaign, decision, amount);
+        pauseForQuota(tenantId, apiKeyId, campaignId, decision, amount);
         return true;
     }
 
-    private void pauseForQuota(UUID tenantId, UUID apiKeyId, UUID campaignId, JsonNode campaign,
+    /**
+     * Pause the campaign upstream, naming the reason.
+     *
+     * <p>The reason travels <b>on the pause call</b> rather than on an event of our own. Pausing is the
+     * only thing that stops the runner promoting the campaign, and that transition already emits
+     * {@code campaign.paused}; emitting a second one here to carry the reason meant a partner received
+     * two events for one transition, the first of them claiming {@code MANUAL}. tenants-service now
+     * stamps {@code QUOTA} on the transition and emits the single event.
+     *
+     * <p>Which makes the failure path below matter more than it used to: if the pause call does not land,
+     * there is no event either, so the log line is the only record. The campaign starts and its sends are
+     * metered one at a time, which is a worse outcome than a pause but not a wrong one.
+     */
+    private void pauseForQuota(UUID tenantId, UUID apiKeyId, UUID campaignId,
                                QuotaService.Decision decision, int amount) {
         log.info("Campaign {} cannot start: {} quota of {} exhausted, {} messages needed",
                 campaignId, decision.scope(), decision.limit(), amount);
         try {
-            tenantsClient.transitionCampaign(tenantId, apiKeyId, campaignId.toString(), "pause");
+            tenantsClient.transitionCampaign(tenantId, apiKeyId, campaignId.toString(), "pause",
+                    Map.of("reason", WebhookEvents.PAUSE_REASON_QUOTA));
         } catch (Exception e) {
-            // The runner will start it anyway and the sends will be metered one at a time, which is a
-            // worse outcome than a pause but not a wrong one. Logged at warn because it means a partner
-            // is about to go over its pool.
-            log.warn("Could not pause over-quota campaign {}: {}", campaignId, e.getMessage());
+            log.warn("Could not pause over-quota campaign {} — it will start and be metered per send: "
+                    + "{}", campaignId, e.getMessage());
         }
-        eventPublisher.publishCampaignQuotaPaused(tenantId, campaignId, summary(campaign),
-                decision.scope(), decision.limit(), amount);
     }
 
     /**
@@ -216,19 +224,6 @@ public class ScheduledCampaignQuotaJob {
                 planResolver.resolve(ownerTenantId),
                 new PartnerPrincipal(row.getPartnerId(), ownerTenantId, tenantId,
                         row.getMessagesPerDayCap()));
-    }
-
-    /** The campaign fields worth putting on the event — not the whole body, which can be large. */
-    private Map<String, Object> summary(JsonNode campaign) {
-        Map<String, Object> summary = new LinkedHashMap<>();
-        summary.put("campaignId", text(campaign, "id"));
-        summary.put("name", text(campaign, "name"));
-        summary.put("clientRef", text(campaign, "clientRef"));
-        summary.put("scheduledAt", text(campaign, "scheduledAt"));
-        if (campaign.has("counts")) {
-            summary.put("counts", campaign.get("counts"));
-        }
-        return summary;
     }
 
     /**
