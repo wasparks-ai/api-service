@@ -28,10 +28,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * The console's cross-client campaign views and the per-customer frequency guard (§B6).
  *
- * <p>Two of the three upstream endpoints exercised here — {@code GET /internal/v1/campaigns/across} and
- * {@code GET /internal/v1/tenants/{id}/settings} — are <b>not in internal.md</b>. The stubs below encode
- * what this service assumes of them, so if the real shapes differ these are the assertions that will say
- * so rather than a partner discovering it.
+ * <p>The stubs below are the shapes {@code internal.md} documents, not shapes assumed from a path name.
+ * They were assumed once: {@code /internal/v1/campaigns/across} returns {@code {items, nextCursor,
+ * hasMore}} with a keyset cursor, and this service read {@code content} and paged by an offset — so the
+ * merged list would have come back empty in production while every test here passed against a stub that
+ * agreed with the bug. Any stub that drifts from {@code internal.md} again is worth exactly as much.
  */
 class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
 
@@ -64,11 +65,12 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
         UUID second = addClient(partnerId, "cust_2", null);
 
         Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
-                        Mockito.any()))
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
                 .thenReturn(objectMapper.readTree("""
-                        {"content":[
+                        {"items":[
                           {"id":"c1","name":"Ours","status":"COMPLETED","tenantId":"%s"},
-                          {"id":"c2","name":"Theirs","status":"RUNNING","tenantId":"%s"}]}
+                          {"id":"c2","name":"Theirs","status":"RUNNING","tenantId":"%s"}],
+                         "nextCursor":null,"hasMore":false}
                         """.formatted(tenantId, first)));
 
         mockMvc.perform(get("/v1/partner/campaigns").header("Authorization", jwt()))
@@ -85,8 +87,119 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<UUID>> tenants = ArgumentCaptor.forClass(List.class);
         Mockito.verify(tenantsClient).campaignsAcross(Mockito.eq(tenantId), Mockito.any(),
-                tenants.capture(), Mockito.any());
+                tenants.capture(), Mockito.any(), Mockito.any(), Mockito.anyInt());
         assertThat(tenants.getValue()).containsExactlyInAnyOrder(tenantId, first, second);
+    }
+
+    @Test
+    @DisplayName("the keyset cursor is passed through in both directions, untouched")
+    void keysetCursorPassesThrough() throws Exception {
+        UUID clientId = addClient(partnerId, "cust_1", null);
+        String upstreamCursor = "MjAyNi0wOS0xNVQxMDowMDowMFp8N2Yz";
+
+        Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenReturn(objectMapper.readTree("""
+                        {"items":[{"id":"c1","tenantId":"%s"}],
+                         "nextCursor":"%s","hasMore":true}""".formatted(clientId, upstreamCursor)));
+
+        // Upstream's cursor comes out of meta.next_cursor exactly as it went in. Re-encoding it would be
+        // a second pagination scheme layered on one that already works.
+        mockMvc.perform(get("/v1/partner/campaigns").header("Authorization", jwt()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.meta.next_cursor").value(upstreamCursor));
+
+        // And it goes back untouched on the next page.
+        mockMvc.perform(get("/v1/partner/campaigns?cursor=" + upstreamCursor)
+                        .header("Authorization", jwt()))
+                .andExpect(status().isOk());
+
+        ArgumentCaptor<String> sent = ArgumentCaptor.forClass(String.class);
+        Mockito.verify(tenantsClient, Mockito.times(2)).campaignsAcross(Mockito.any(), Mockito.any(),
+                Mockito.anyList(), Mockito.any(), sent.capture(), Mockito.anyInt());
+        assertThat(sent.getAllValues().get(0)).isNull();
+        assertThat(sent.getAllValues().get(1)).isEqualTo(upstreamCursor);
+    }
+
+    @Test
+    @DisplayName("nextCursor null on the last page means no next_cursor")
+    void lastPageOfTheMergedList() throws Exception {
+        addClient(partnerId, "cust_1", null);
+        Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenReturn(objectMapper.readTree(
+                        "{\"items\":[{\"id\":\"c1\"}],\"nextCursor\":null,\"hasMore\":false}"));
+
+        mockMvc.perform(get("/v1/partner/campaigns").header("Authorization", jwt()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].id").value("c1"))
+                .andExpect(jsonPath("$.meta.next_cursor").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("an omitted nextCursor reads as the end of the walk, like a null one")
+    void lastPageOmitsTheCursorEntirely() throws Exception {
+        addClient(partnerId, "cust_1", null);
+        // What the running service actually sends on the last page: the key is absent, not null.
+        // internal.md describes it as null, and both have to mean "no more" — confirmed live.
+        Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenReturn(objectMapper.readTree("{\"items\":[{\"id\":\"c1\"}],\"hasMore\":false}"));
+
+        mockMvc.perform(get("/v1/partner/campaigns").header("Authorization", jwt()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].id").value("c1"))
+                .andExpect(jsonPath("$.meta.next_cursor").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("upstream's 400 on a malformed cursor becomes ours, naming the cursor")
+    void malformedKeysetCursor() throws Exception {
+        addClient(partnerId, "cust_1", null);
+        Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenThrow(new UpstreamRejectedException("invalid_request",
+                        "Malformed cursor.", 400));
+
+        // Upstream refuses rather than restarting from the top, which would look like new data. That
+        // decision is worth preserving all the way out to the caller that sent the cursor.
+        mockMvc.perform(get("/v1/partner/campaigns?cursor=garbage").header("Authorization", jwt()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("validation_failed"))
+                .andExpect(jsonPath("$.error.details.parameter").value("cursor"));
+    }
+
+    @Test
+    @DisplayName("a 400 with no cursor in play is not blamed on the cursor")
+    void otherBadRequestsAreNotCursorErrors() throws Exception {
+        addClient(partnerId, "cust_1", null);
+        Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenThrow(new UpstreamRejectedException("invalid_request",
+                        "Unknown status ACTIVE.", 400));
+
+        mockMvc.perform(get("/v1/partner/campaigns?status=ACTIVE").header("Authorization", jwt()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("invalid_request"))
+                .andExpect(jsonPath("$.error.details.parameter").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("more than 50 active customers is refused here, not upstream")
+    void tenantBound() throws Exception {
+        // 49 clients plus the partner's own tenant is 50 — the documented ceiling. One more is over.
+        for (int i = 0; i < 50; i++) {
+            addClient(partnerId, "cust_bulk_" + i, null);
+        }
+
+        mockMvc.perform(get("/v1/partner/campaigns").header("Authorization", jwt()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("validation_failed"))
+                .andExpect(jsonPath("$.error.details.limit").value(50))
+                .andExpect(jsonPath("$.error.details.activeCustomers").value(51));
+
+        Mockito.verify(tenantsClient, Mockito.never()).campaignsAcross(Mockito.any(), Mockito.any(),
+                Mockito.anyList(), Mockito.any(), Mockito.any(), Mockito.anyInt());
     }
 
     @Test
@@ -96,8 +209,9 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
         addClient(partnerId, "cust_2", null, "SUSPENDED");
 
         Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
-                        Mockito.any()))
-                .thenReturn(objectMapper.readTree("{\"content\":[]}"));
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenReturn(objectMapper.readTree(
+                        "{\"items\":[],\"nextCursor\":null,\"hasMore\":false}"));
 
         mockMvc.perform(get("/v1/partner/campaigns").header("Authorization", jwt()))
                 .andExpect(status().isOk())
@@ -106,7 +220,7 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<UUID>> tenants = ArgumentCaptor.forClass(List.class);
         Mockito.verify(tenantsClient).campaignsAcross(Mockito.any(), Mockito.any(),
-                tenants.capture(), Mockito.any());
+                tenants.capture(), Mockito.any(), Mockito.any(), Mockito.anyInt());
         // Its campaigns are not running and cannot be started; showing them would be rows the partner
         // can do nothing about from this screen.
         assertThat(tenants.getValue()).containsExactlyInAnyOrder(tenantId, active);
@@ -126,7 +240,7 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
                 .andExpect(jsonPath("$.content").doesNotExist());
 
         Mockito.verify(tenantsClient, Mockito.never()).campaignsAcross(Mockito.any(), Mockito.any(),
-                Mockito.anyList(), Mockito.any());
+                Mockito.anyList(), Mockito.any(), Mockito.any(), Mockito.anyInt());
     }
 
     @Test
@@ -165,9 +279,10 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
     void bothBranchesAgreeOnTheShape() throws Exception {
         UUID clientId = addClient(partnerId, "cust_1", null);
         Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
-                        Mockito.any()))
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
                 .thenReturn(objectMapper.readTree(
-                        "{\"content\":[{\"id\":\"c1\",\"tenantId\":\"%s\"}]}".formatted(clientId)));
+                        ("{\"items\":[{\"id\":\"c1\",\"tenantId\":\"%s\"}],"
+                                + "\"nextCursor\":null,\"hasMore\":false}").formatted(clientId)));
         Mockito.when(tenantsClient.listCampaigns(Mockito.eq(clientId), Mockito.any(), Mockito.any()))
                 .thenReturn(objectMapper.readTree("{\"content\":[{\"id\":\"c1\"}]}"));
 
@@ -393,13 +508,13 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
-    @DisplayName("the guard PATCH still validates its range locally")
+    @DisplayName("the guard PATCH validates upstream's 0-30 range locally")
     void guardRange() throws Exception {
         UUID clientId = addClient(partnerId, "cust_1", null);
         mockMvc.perform(patch("/v1/partner/customers/" + clientId + "/settings")
                         .header("Authorization", jwt())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"minDaysBetweenMarketing\":400}"))
+                        .content("{\"minDaysBetweenMarketing\":31}"))
                 .andExpect(status().isBadRequest());
 
         Mockito.verify(tenantsClient, Mockito.never())
@@ -408,20 +523,23 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
 
     /** Guards against the stub drifting from what the service actually calls. */
     @Test
-    @DisplayName("the merged list asks upstream with the partner's own tenant as the acting one")
+    @DisplayName("the merged list asks upstream as the partner, with the status and limit it was given")
     void acrossActsAsThePartner() throws Exception {
         addClient(partnerId, "cust_1", null);
         Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
-                        Mockito.any()))
-                .thenReturn((JsonNode) objectMapper.readTree("[]"));
+                        Mockito.any(), Mockito.any(), Mockito.anyInt()))
+                .thenReturn(objectMapper.readTree(
+                        "{\"items\":[],\"nextCursor\":null,\"hasMore\":false}"));
 
-        mockMvc.perform(get("/v1/partner/campaigns?status=RUNNING").header("Authorization", jwt()))
+        mockMvc.perform(get("/v1/partner/campaigns?status=RUNNING&limit=10")
+                        .header("Authorization", jwt()))
                 .andExpect(status().isOk());
 
-        ArgumentCaptor<MultiValueMap<String, String>> query =
-                ArgumentCaptor.forClass(MultiValueMap.class);
+        ArgumentCaptor<String> status = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Integer> limit = ArgumentCaptor.forClass(Integer.class);
         Mockito.verify(tenantsClient).campaignsAcross(Mockito.eq(tenantId), Mockito.any(),
-                Mockito.anyList(), query.capture());
-        assertThat(query.getValue().getFirst("status")).isEqualTo("RUNNING");
+                Mockito.anyList(), status.capture(), Mockito.any(), limit.capture());
+        assertThat(status.getValue()).isEqualTo("RUNNING");
+        assertThat(limit.getValue()).isEqualTo(10);
     }
 }

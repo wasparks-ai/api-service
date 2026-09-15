@@ -280,8 +280,8 @@ public class PartnerConsoleService {
      * console has to be the one the partner typed, not the tenant's company name.
      */
     @Transactional(readOnly = true)
-    public PagedResponse<Object> campaignsAcross(Console console, MultiValueMap<String, String> query,
-                                                 int page, int size) {
+    public PagedResponse<Object> campaignsAcross(Console console, String status, String cursor,
+                                                 int limit) {
         Map<UUID, String> names = new LinkedHashMap<>();
         UUID ownerTenantId = console.principal().partner().ownerTenantId();
         names.put(ownerTenantId, partnerName(console));
@@ -292,9 +292,10 @@ public class PartnerConsoleService {
                 names.put(link.getTenantId(), customerName(link));
             }
         }
+        requireWithinTenantBound(names.size());
 
-        JsonNode upstream = upstreamNode(() -> tenantsClient.campaignsAcross(ownerTenantId,
-                console.principal().keyId(), List.copyOf(names.keySet()), query));
+        JsonNode upstream = acrossUpstream(cursor, () -> tenantsClient.campaignsAcross(ownerTenantId,
+                console.principal().keyId(), List.copyOf(names.keySet()), status, cursor, limit));
 
         List<Object> rows = new ArrayList<>();
         for (JsonNode campaign : campaignRows(upstream)) {
@@ -308,10 +309,57 @@ public class PartnerConsoleService {
         }
 
         // The same envelope the single-customer branch returns. They are one endpoint, and a caller
-        // should not be able to tell which branch it took from the shape of the answer — which is
-        // exactly what it could do before, because this one hand-built {data, meta} while the other
-        // handed upstream's Spring page straight through.
-        return UpstreamPages.envelope(rows, page, size, Map.of("customerCount", names.size()));
+        // should not be able to tell which branch it took from the shape of the answer.
+        return UpstreamPages.keysetEnvelope(rows, upstream,
+                Map.of("customerCount", names.size()));
+    }
+
+    /**
+     * Upstream takes 1–50 tenants per call and 400s outside that (internal.md).
+     *
+     * <p>Refused here with an answer the partner can act on, rather than passed through to become an
+     * {@code invalid_request} about a parameter it never sent. Truncating to the first fifty was the
+     * alternative and is worse: a merged list silently missing a partner's newest customers looks like
+     * those customers have no campaigns.
+     *
+     * <p>A partner with more than fifty active customers therefore cannot use the merged view and has to
+     * narrow with {@code customerId}. That is an upstream limit rather than a choice made here — see the
+     * hand-off report.
+     */
+    private void requireWithinTenantBound(int tenantCount) {
+        if (tenantCount > InternalTenantsClient.ACROSS_MAX_TENANTS) {
+            throw ApiException.of(ApiErrorCode.VALIDATION_FAILED,
+                            "The merged campaigns list covers up to "
+                                    + InternalTenantsClient.ACROSS_MAX_TENANTS
+                                    + " customers at a time. Pass `customerId` to look at one.")
+                    .withDetail("limit", InternalTenantsClient.ACROSS_MAX_TENANTS)
+                    .withDetail("activeCustomers", tenantCount);
+        }
+    }
+
+    /**
+     * The across call's failures, with the cursor case named.
+     *
+     * <p>Upstream answers {@code 400 invalid_request} for a malformed cursor rather than silently
+     * restarting from the top — which is the right call, and it is worth preserving all the way out. The
+     * caller sent that cursor, so when a cursor was supplied the 400 is reported as a cursor problem in
+     * our own vocabulary; upstream's message is kept either way, because the same status also covers a
+     * bad {@code status} value and swallowing that would send someone hunting the wrong parameter.
+     */
+    private JsonNode acrossUpstream(String cursor, java.util.function.Supplier<JsonNode> call) {
+        try {
+            return call.get();
+        } catch (UpstreamRejectedException rejected) {
+            if (rejected.getStatus() == 400 && cursor != null && !cursor.isBlank()) {
+                throw ApiException.of(ApiErrorCode.VALIDATION_FAILED,
+                                "`cursor` is not one we issued, or it has expired. Omit it to start "
+                                        + "from the first page. (" + rejected.getMessage() + ")")
+                        .withDetail("parameter", "cursor");
+            }
+            throw rejected.toApiException();
+        } catch (UpstreamUnavailableException unavailable) {
+            throw ApiException.of(ApiErrorCode.UPSTREAM_UNAVAILABLE);
+        }
     }
 
     /**

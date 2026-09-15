@@ -62,7 +62,17 @@ boot — `ddl-auto=validate` will refuse to start otherwise, which is the point.
 mvn test
 ```
 
-234 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
+Three tests in `AcrossLiveContractTest` drive `GET /internal/v1/campaigns/across` against a **running**
+tenants-service and are skipped unless you ask for them. They exist because that endpoint's shape was
+once assumed rather than read, and stubs agreeing with an assumption prove nothing:
+
+```bash
+# tenants-service on 8081, fixture seeded (see the test's javadoc)
+mvn test -Dtest=AcrossLiveContractTest -Dlive.tenants=true
+```
+
+240 tests, plus 3 live ones that are skipped unless you ask for them (below). They run against a
+**real PostgreSQL and a real Redis** through Testcontainers, so Docker
 must be running. The schema comes from `src/test/resources/db/schema-test.sql`, a trimmed transcript of
 the real migrations, and the entities are validated against it exactly as they are in production.
 
@@ -186,6 +196,25 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
 
 ## Changelog
 
+### 2026-09-16 — the merged campaign list reads the documented shape
+
+`GET /internal/v1/campaigns/across` returns `{items, nextCursor, hasMore}` and pages by **keyset**. The
+client read `content` and paged by offset, which had been assumed from the endpoint's name before
+`internal.md` documented it — so `GET /v1/partner/campaigns` with no `customerId` would have come back
+empty in production, with every stubbed test passing because the stubs agreed with the bug.
+
+The client now reads `items`, and the cursor is upstream's own, passed through untouched in both
+directions rather than re-encoded as one of ours. A malformed cursor is upstream's `400` mapped to our
+`validation_failed` naming the cursor, rather than a silent restart from the top. `AcrossLiveContractTest`
+exercises it against a running tenants-service so the shape cannot drift unnoticed again.
+
+Two consequences for callers of `GET /v1/partner/campaigns`: a cursor is not interchangeable between the
+merged list and a single customer's (different machinery upstream; each refuses the other's), and the
+merged list is capped at 50 customers.
+
+Also aligns `minDaysBetweenMarketing` to upstream's documented 0–30 range; it was validated locally as
+0–365, so 31–365 passed here and then failed upstream.
+
 ### 2026-09-16 — `GET /v1/templates` answers in the house envelope · **breaking**
 
 Every collection read on `/v1` now returns `{data, meta}` and pages with `cursor`/`limit`.
@@ -231,11 +260,11 @@ Nothing else about the endpoint changed: the same filters, the same rows, the sa
   endpoint this build needed that `internal.md` lacks.
 - **`app_access` is stored and reported but nothing acts on it** — the branded client login is a later
   phase of the partner epic.
-- **Two internal endpoints this build calls are not in `internal.md`**: `GET
-  /internal/v1/tenants/{id}/settings` (only the PATCH is documented) and `GET
-  /internal/v1/campaigns/across`. Both are implemented against the paths the hand-off named and read
-  defensively, and `minDaysBetweenMarketing` degrades to `0` if the GET is missing — but the shapes are
-  assumptions until `internal.md` catches up.
+- **The merged campaign list covers at most 50 customers.** `GET /internal/v1/campaigns/across` takes
+  1–50 tenant ids per call, so a partner with more active customers than that gets a `400` from
+  `GET /v1/partner/campaigns` telling it to narrow with `customerId`. Refused here rather than
+  truncated, because a merged list silently missing a partner's newest customers looks like those
+  customers have no campaigns. Lifting it needs upstream to page the tenant set as well as the rows.
 - **`GET /v1/partner/campaigns/{id}/recipients` without `customerId` costs a lookup per customer.** There
   is no cross-tenant campaign read, so the owner is found by asking each of the partner's tenants in
   turn. The console passes `customerId` from the row it was already showing; the fallback is for a pasted

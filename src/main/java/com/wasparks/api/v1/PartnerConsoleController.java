@@ -86,6 +86,9 @@ public class PartnerConsoleController {
     private final CustomerSettingsService settingsService;
     private final ObjectMapper objectMapper;
 
+    /** internal.md caps the marketing frequency guard at a month. */
+    private static final int MAX_FREQUENCY_GUARD_DAYS = 30;
+
     // ------------------------------------------------------------------ identity
 
     @GetMapping
@@ -181,7 +184,7 @@ public class PartnerConsoleController {
 
     @Data
     public static class FrequencyGuardRequest {
-        /** Days between marketing templates to the same number. `0` turns the guard off. */
+        /** Days between marketing templates to the same number, 0-30. `0` turns the guard off. */
         private Integer minDaysBetweenMarketing;
     }
 
@@ -200,9 +203,12 @@ public class PartnerConsoleController {
                                                  @RequestBody FrequencyGuardRequest request) {
         ApiPrincipal principal = console().principal();
         Integer days = request.getMinDaysBetweenMarketing();
-        if (days == null || days < 0 || days > 365) {
+        // 0-30 is upstream's range (internal.md): beyond a month this stops being a frequency cap and
+        // becomes a suppression list. Checked here so the caller gets our message rather than a 400
+        // about a field it will have to go and look up.
+        if (days == null || days < 0 || days > MAX_FREQUENCY_GUARD_DAYS) {
             throw ApiException.of(ApiErrorCode.VALIDATION_FAILED,
-                    "`minDaysBetweenMarketing` must be between 0 and 365.");
+                    "`minDaysBetweenMarketing` must be between 0 and " + MAX_FREQUENCY_GUARD_DAYS + ".");
         }
         ApiPrincipal acting = customerService.actingOn(principal, id);
         proxy(() -> tenantsClient.updateTenantSettings(acting,
@@ -388,30 +394,40 @@ public class PartnerConsoleController {
                     and cannot be started.
 
                     Pass `customerId` to narrow to one customer, or `customerId=self` for your own
-                    account. Your own tenant has no customer id of its own, which is what `self` is for.""")
+                    account. Your own tenant has no customer id of its own, which is what `self` is for.
+
+                    Page with `meta.next_cursor` either way, but do not carry a cursor between the two:
+                    the merged list and a single customer's are paged by different machinery upstream, so
+                    a cursor from one is refused by the other rather than silently misread.
+
+                    The merged list covers up to 50 customers. A partner with more has to narrow.""")
     public PagedResponse<Object> campaigns(@RequestParam(required = false) String customerId,
                                            @RequestParam(required = false) String status,
                                            @RequestParam(required = false) String cursor,
                                            @RequestParam(required = false) Integer limit) {
         PartnerConsoleService.Console console = console();
         int size = PagedResponse.clampLimit(limit);
-        int page = UpstreamPages.decodeCursor(cursor);
+        UUID selected = consoleService.resolveCustomerSelector(console, customerId);
 
+        if (selected == null) {
+            // The merged list pages by KEYSET upstream, so the cursor is upstream's own and travels
+            // through untouched. Decoding it here as a page number — which is what every other proxied
+            // list does, because every other upstream list pages by offset — would reject a valid
+            // cursor and page the wrong list.
+            return consoleService.campaignsAcross(console, status, cursor, size);
+        }
+
+        // A named customer goes through the ordinary per-tenant read, which pages by offset and re-proves
+        // the link. The merged list proves it differently (it only ever asks for tenants it has already
+        // resolved), and both paths have to prove it somehow. Both return the same envelope: they are one
+        // endpoint, and a caller should not be able to tell which branch it took from the answer's shape.
+        int page = UpstreamPages.decodeCursor(cursor);
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
         if (status != null && !status.isBlank()) {
             query.add("status", status);
         }
         UpstreamPages.pageParams(page, size).forEach(query::add);
 
-        UUID selected = consoleService.resolveCustomerSelector(console, customerId);
-        if (selected == null) {
-            return consoleService.campaignsAcross(console, query, page, size);
-        }
-
-        // A named customer goes through the ordinary per-tenant read, which re-proves the link — the
-        // merged list proves it differently (it only ever asks for tenants it has already resolved), and
-        // both paths have to prove it somehow. Both return the same envelope: they are one endpoint, and
-        // a caller should not be able to tell which branch it took from the shape of the answer.
         ApiPrincipal acting = ownerPrincipal(console, selected);
         JsonNode upstream = proxy(() ->
                 tenantsClient.listCampaigns(acting.tenantId(), acting.keyId(), query));

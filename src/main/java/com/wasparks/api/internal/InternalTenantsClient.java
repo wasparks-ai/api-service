@@ -230,28 +230,48 @@ public class InternalTenantsClient {
                 tenantId, apiKeyId, null, JsonNode.class);
     }
 
+    /** {@code tenantIds} is 1–50 per call (internal.md); outside that range upstream 400s. */
+    public static final int ACROSS_MIN_TENANTS = 1;
+    public static final int ACROSS_MAX_TENANTS = 50;
+
     /**
-     * Campaigns across several tenants in one call — the Partner console's cross-client list (§B6).
+     * Campaigns across several tenants in one call — the Partner console's cross-client list (§B6,
+     * internal.md "the cross-client list").
      *
-     * <p>The one read on this surface that is not scoped to a single tenant, which is why it names its
-     * tenants explicitly rather than relying on the header. {@code X-Tenant-Id} is still sent, and is
-     * still the partner's own tenant, so the audit context and the chain's own rules are unchanged;
-     * upstream is expected to refuse any id in {@code tenantIds} that the caller has not been cleared
-     * for. This service only ever passes ids it has already proved belong to the partner.
+     * <p>The one read on this surface whose scope comes from the <b>query</b> rather than from
+     * {@code X-Tenant-Id}, because it is a partner-level read by definition and tenants-service does not
+     * map {@code api_partner_tenants} — on purpose. Upstream re-checks nothing, so
+     * <b>{@link com.wasparks.api.partner.PartnerConsoleService} must pass only ids it has already proved
+     * belong to the partner</b>, exactly as it does for the {@code tenantId} on a setup link. The header
+     * is still sent and is still the partner's own tenant, for the audit context.
      *
-     * <p><b>This endpoint is not in internal.md.</b> The path and the {@code tenantIds} parameter are
-     * what the hand-off named; the response is read defensively ({@code content}, {@code data} or a bare
-     * array, and each row's {@code tenantId}) so a shape that differs in the details still works. See the
-     * report.
+     * <h2>Keyset, not offset</h2>
+     * The cursor is upstream's own — an opaque {@code created_at|id} pair — and is passed through
+     * <b>untouched</b> in both directions. This list is read at the head, where new campaigns land, so an
+     * offset would skip or repeat rows between pages; and a cursor this service re-encoded would be a
+     * second pagination scheme layered on one that already works.
+     *
+     * <p>That makes it the exception to {@code UpstreamPages}' base64 page numbers, which every other
+     * proxied list here uses because every other upstream list pages by offset.
      */
     public JsonNode campaignsAcross(UUID actingTenantId, UUID apiKeyId, List<UUID> tenantIds,
-                                    MultiValueMap<String, String> query) {
+                                    String status, String cursor, int limit) {
         String ids = tenantIds.stream().map(UUID::toString).collect(Collectors.joining(","));
         return exchange(HttpMethod.GET,
-                uri -> uri.path("/internal/v1/campaigns/across")
-                        .queryParams(query)
-                        .queryParam("tenantIds", ids)
-                        .build(),
+                uri -> {
+                    UriBuilder builder = uri.path("/internal/v1/campaigns/across")
+                            // Comma-separated rather than repeated: both are accepted, and one parameter
+                            // keeps a 50-tenant request inside any sane URL length.
+                            .queryParam("tenantIds", ids)
+                            .queryParam("limit", limit);
+                    if (status != null && !status.isBlank()) {
+                        builder = builder.queryParam("status", status);
+                    }
+                    if (cursor != null && !cursor.isBlank()) {
+                        builder = builder.queryParam("cursor", cursor);
+                    }
+                    return builder.build();
+                },
                 actingTenantId, apiKeyId, null, JsonNode.class);
     }
 

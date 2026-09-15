@@ -415,7 +415,8 @@ curl -X PATCH https://developer.wasparks.com/v1/partner/customers/6d0b…/settin
 
 With this set, campaign creation skips any recipient who already received a MARKETING template from that
 customer within seven days and reports them as `counts.frequencySkipped`. UTILITY and AUTHENTICATION
-templates are never guarded. `0` (the default) is off.
+templates are never guarded. `0` (the default) is off, and the maximum is `30` — past a month it stops
+being a frequency cap and becomes a suppression list.
 
 The value in force comes back on every customer row as `minDaysBetweenMarketing`, on both
 `GET /v1/customers` and the console's own list, so you never have to remember what you set.
@@ -479,6 +480,7 @@ WABA and Meta.
   is also possible by hand there: creating customers, generating links, issuing keys, watching usage.
   It also has two views the API does not: **every customer's campaigns in one list**
   (`GET /v1/partner/campaigns`, each row carrying `customerId` and `customerName`, or
-  `?customerId=self` for your own account), and **a campaign's recipients**
-  (`GET /v1/partner/campaigns/{id}/recipients?status=&cursor=`) so support can see exactly who was not
-  sent to and why. Both are read-only and authenticated with your WaSparks session, not with a key.
+  `?customerId=self` for your own account; up to 50 customers at a time), and **a campaign's
+  recipients** (`GET /v1/partner/campaigns/{id}/recipients?status=&cursor=`) so support can see exactly
+  who was not sent to and why. Both are read-only and authenticated with your WaSparks session, not with
+  a key. Cursors are not interchangeable between the merged list and a single customer's.
