@@ -1,6 +1,7 @@
 package com.wasparks.api.v1;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.CurrentPrincipal;
 import com.wasparks.api.auth.RequiredScope;
@@ -51,6 +52,7 @@ public class AudiencesController {
 
     private final InternalTenantsClient tenantsClient;
     private final CampaignService campaignService;
+    private final ObjectMapper objectMapper;
 
     @PostMapping
     @RequiredScope(Scope.CAMPAIGNS_WRITE)
@@ -76,10 +78,13 @@ public class AudiencesController {
     @RequiredScope(Scope.CAMPAIGNS_READ)
     @PreAuthorize("hasAuthority('SCOPE_campaigns:read')")
     @Operation(summary = "List audiences")
-    public JsonNode list(@RequestParam(required = false) Integer page,
-                         @RequestParam(required = false) Integer size) {
+    public PagedResponse<Object> list(@RequestParam(required = false) String cursor,
+                                      @RequestParam(required = false) Integer limit) {
         ApiPrincipal principal = CurrentPrincipal.api();
-        return proxy(() -> tenantsClient.listAudiences(principal, paging(page, size)));
+        int size = PagedResponse.clampLimit(limit);
+        int page = UpstreamPages.decodeCursor(cursor);
+        JsonNode upstream = proxy(() -> tenantsClient.listAudiences(principal, paging(page, size)));
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     @GetMapping("/{id}")
@@ -96,11 +101,15 @@ public class AudiencesController {
     @PreAuthorize("hasAuthority('SCOPE_campaigns:read')")
     @Operation(summary = "List an audience's members",
             description = "Each member's phone, status and variables.")
-    public JsonNode members(@PathVariable String id,
-                            @RequestParam(required = false) Integer page,
-                            @RequestParam(required = false) Integer size) {
+    public PagedResponse<Object> members(@PathVariable String id,
+                                        @RequestParam(required = false) String cursor,
+                                        @RequestParam(required = false) Integer limit) {
         ApiPrincipal principal = CurrentPrincipal.api();
-        return proxy(() -> tenantsClient.audienceMembers(principal, id, paging(page, size)));
+        int size = PagedResponse.clampLimit(limit);
+        int page = UpstreamPages.decodeCursor(cursor);
+        JsonNode upstream = proxy(() ->
+                tenantsClient.audienceMembers(principal, id, paging(page, size)));
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     @PostMapping("/{id}/members")
@@ -152,14 +161,9 @@ public class AudiencesController {
         return ResponseEntity.noContent().build();
     }
 
-    private MultiValueMap<String, String> paging(Integer page, Integer size) {
+    private MultiValueMap<String, String> paging(int page, int size) {
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
-        if (page != null) {
-            query.add("page", String.valueOf(page));
-        }
-        if (size != null) {
-            query.add("size", String.valueOf(PagedResponse.clampLimit(size)));
-        }
+        UpstreamPages.pageParams(page, size).forEach(query::add);
         return query;
     }
 

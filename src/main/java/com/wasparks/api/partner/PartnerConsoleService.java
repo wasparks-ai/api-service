@@ -24,6 +24,8 @@ import com.wasparks.api.repository.ApiKeyRepository;
 import com.wasparks.api.repository.ApiPartnerTenantRepository;
 import com.wasparks.api.repository.ApiUsageDailyRepository;
 import com.wasparks.api.repository.TenantRefRepository;
+import com.wasparks.api.v1.PagedResponse;
+import com.wasparks.api.v1.UpstreamPages;
 import com.wasparks.api.entity.ApiUsageDaily;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -278,7 +280,8 @@ public class PartnerConsoleService {
      * console has to be the one the partner typed, not the tenant's company name.
      */
     @Transactional(readOnly = true)
-    public Map<String, Object> campaignsAcross(Console console, MultiValueMap<String, String> query) {
+    public PagedResponse<Object> campaignsAcross(Console console, MultiValueMap<String, String> query,
+                                                 int page, int size) {
         Map<UUID, String> names = new LinkedHashMap<>();
         UUID ownerTenantId = console.principal().partner().ownerTenantId();
         names.put(ownerTenantId, partnerName(console));
@@ -290,11 +293,12 @@ public class PartnerConsoleService {
             }
         }
 
-        JsonNode page = upstreamNode(() -> tenantsClient.campaignsAcross(ownerTenantId,
+        JsonNode upstream = upstreamNode(() -> tenantsClient.campaignsAcross(ownerTenantId,
                 console.principal().keyId(), List.copyOf(names.keySet()), query));
 
-        List<Map<String, Object>> rows = new ArrayList<>();
-        for (JsonNode campaign : campaignRows(page)) {
+        List<Object> rows = new ArrayList<>();
+        for (JsonNode campaign : campaignRows(upstream)) {
+            @SuppressWarnings("unchecked")
             Map<String, Object> row = objectMapper.convertValue(campaign, LinkedHashMap.class);
             UUID rowTenantId = uuid(campaign, "tenantId");
             row.put("customerId", rowTenantId == null ? null
@@ -303,10 +307,11 @@ public class PartnerConsoleService {
             rows.add(row);
         }
 
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("data", rows);
-        body.put("meta", Map.of("customerCount", names.size()));
-        return body;
+        // The same envelope the single-customer branch returns. They are one endpoint, and a caller
+        // should not be able to tell which branch it took from the shape of the answer — which is
+        // exactly what it could do before, because this one hand-built {data, meta} while the other
+        // handed upstream's Spring page straight through.
+        return UpstreamPages.envelope(rows, page, size, Map.of("customerCount", names.size()));
     }
 
     /**
@@ -376,21 +381,10 @@ public class PartnerConsoleService {
         }
     }
 
-    /** Upstream's list shape, read defensively — see {@code campaignsAcross}. */
-    private Iterable<JsonNode> campaignRows(JsonNode page) {
-        if (page == null) {
-            return List.of();
-        }
-        if (page.isArray()) {
-            return page;
-        }
-        for (String field : List.of("content", "data", "campaigns")) {
-            JsonNode rows = page.get(field);
-            if (rows != null && rows.isArray()) {
-                return rows;
-            }
-        }
-        return List.of();
+    /** Upstream's list shape, read defensively — see {@link UpstreamPages}. */
+    private Iterable<JsonNode> campaignRows(JsonNode upstream) {
+        JsonNode rows = UpstreamPages.rowsNode(upstream);
+        return rows == null ? List.of() : rows;
     }
 
     private String partnerName(Console console) {

@@ -44,12 +44,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -391,32 +389,33 @@ public class PartnerConsoleController {
 
                     Pass `customerId` to narrow to one customer, or `customerId=self` for your own
                     account. Your own tenant has no customer id of its own, which is what `self` is for.""")
-    public Object campaigns(@RequestParam(required = false) String customerId,
-                            @RequestParam(required = false) String status,
-                            @RequestParam(required = false) Integer page,
-                            @RequestParam(required = false) Integer size) {
+    public PagedResponse<Object> campaigns(@RequestParam(required = false) String customerId,
+                                           @RequestParam(required = false) String status,
+                                           @RequestParam(required = false) String cursor,
+                                           @RequestParam(required = false) Integer limit) {
         PartnerConsoleService.Console console = console();
+        int size = PagedResponse.clampLimit(limit);
+        int page = UpstreamPages.decodeCursor(cursor);
+
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
         if (status != null && !status.isBlank()) {
             query.add("status", status);
         }
-        if (page != null) {
-            query.add("page", String.valueOf(page));
-        }
-        query.add("size", String.valueOf(PagedResponse.clampLimit(size)));
+        UpstreamPages.pageParams(page, size).forEach(query::add);
 
         UUID selected = consoleService.resolveCustomerSelector(console, customerId);
         if (selected == null) {
-            return consoleService.campaignsAcross(console, query);
+            return consoleService.campaignsAcross(console, query, page, size);
         }
 
         // A named customer goes through the ordinary per-tenant read, which re-proves the link — the
         // merged list proves it differently (it only ever asks for tenants it has already resolved), and
-        // both paths have to prove it somehow.
-        ApiPrincipal acting = selected.equals(console.principal().partner().ownerTenantId())
-                ? console.principal()
-                : customerService.actingOn(console.principal(), selected);
-        return proxy(() -> tenantsClient.listCampaigns(acting.tenantId(), acting.keyId(), query));
+        // both paths have to prove it somehow. Both return the same envelope: they are one endpoint, and
+        // a caller should not be able to tell which branch it took from the shape of the answer.
+        ApiPrincipal acting = ownerPrincipal(console, selected);
+        JsonNode upstream = proxy(() ->
+                tenantsClient.listCampaigns(acting.tenantId(), acting.keyId(), query));
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     @GetMapping("/campaigns/{id}/recipients")
@@ -441,7 +440,7 @@ public class PartnerConsoleController {
             @RequestParam(required = false) Integer limit) {
         PartnerConsoleService.Console console = console();
         int size = PagedResponse.clampLimit(limit);
-        int page = decodeCursor(cursor);
+        int page = UpstreamPages.decodeCursor(cursor);
 
         UUID owner = consoleService.resolveCustomerSelector(console, customerId);
         ApiPrincipal acting = owner == null
@@ -457,7 +456,7 @@ public class PartnerConsoleController {
 
         JsonNode upstream = proxy(() -> tenantsClient.campaignRecipients(
                 acting.tenantId(), acting.keyId(), id, query));
-        return recipientsPage(upstream, page, size);
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -471,68 +470,6 @@ public class PartnerConsoleController {
         return tenantId.equals(console.principal().partner().ownerTenantId())
                 ? console.principal()
                 : customerService.actingOn(console.principal(), tenantId);
-    }
-
-    /**
-     * The cursor is an opaque encoding of a page number.
-     *
-     * <p>Upstream pages this list by offset, and the {@code /v1} envelope promises a cursor
-     * ({@code PagedResponse}) — so one of the two has to be translated, and translating here keeps the
-     * public contract cursor-shaped while nothing upstream changes. It is base64 so that it reads as an
-     * opaque token rather than inviting a caller to do arithmetic on it: the encoding is ours to change
-     * the day this list gets a real keyset cursor.
-     */
-    private int decodeCursor(String cursor) {
-        if (cursor == null || cursor.isBlank()) {
-            return 0;
-        }
-        try {
-            String decoded = new String(Base64.getUrlDecoder().decode(cursor.trim()),
-                    StandardCharsets.UTF_8);
-            int page = Integer.parseInt(decoded);
-            if (page < 0) {
-                throw new NumberFormatException(decoded);
-            }
-            return page;
-        } catch (RuntimeException e) {
-            throw ApiException.of(ApiErrorCode.VALIDATION_FAILED,
-                    "`cursor` is not one we issued. Omit it to start from the first page.");
-        }
-    }
-
-    private String encodeCursor(int page) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(String.valueOf(page).getBytes(StandardCharsets.UTF_8));
-    }
-
-    /**
-     * Upstream's page into the house envelope, with a {@code next_cursor} only when there is more.
-     *
-     * <p>"More" is decided from the row count rather than from a total, because a total is the one field
-     * a paged response cannot be relied on to carry. A full page means there may be another; a short one
-     * is the end. The cost is a single empty last page in the exact-multiple case, which a client that
-     * loops until {@code next_cursor} is absent handles without noticing.
-     */
-    private PagedResponse<Object> recipientsPage(JsonNode upstream, int page, int size) {
-        List<Object> rows = new ArrayList<>();
-        JsonNode content = upstream == null ? null
-                : (upstream.isArray() ? upstream : firstArray(upstream, "content", "data",
-                        "recipients"));
-        if (content != null) {
-            content.forEach(row -> rows.add(objectMapper.convertValue(row, Object.class)));
-        }
-        String next = rows.size() >= size ? encodeCursor(page + 1) : null;
-        return PagedResponse.of(rows, next);
-    }
-
-    private JsonNode firstArray(JsonNode node, String... fields) {
-        for (String field : fields) {
-            JsonNode value = node.get(field);
-            if (value != null && value.isArray()) {
-                return value;
-            }
-        }
-        return null;
     }
 
     private Map<String, Object> toPublic(ApiKey key) {

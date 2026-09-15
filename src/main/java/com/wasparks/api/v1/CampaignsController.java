@@ -1,6 +1,7 @@
 package com.wasparks.api.v1;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wasparks.api.auth.ApiPrincipal;
 import com.wasparks.api.auth.CurrentPrincipal;
 import com.wasparks.api.auth.RequiredScope;
@@ -47,6 +48,7 @@ public class CampaignsController {
 
     private final CampaignService campaignService;
     private final InternalTenantsClient tenantsClient;
+    private final ObjectMapper objectMapper;
 
     @PostMapping
     @RequiredScope(Scope.CAMPAIGNS_WRITE)
@@ -90,16 +92,20 @@ public class CampaignsController {
     @Operation(summary = "List campaigns",
             description = "Newest first. Filter by `status` (DRAFT, SCHEDULED, RUNNING, PAUSED, "
                     + "COMPLETED, CANCELLED).")
-    public JsonNode list(@RequestParam(required = false) String status,
-                         @RequestParam(required = false) Integer page,
-                         @RequestParam(required = false) Integer size) {
+    public PagedResponse<Object> list(@RequestParam(required = false) String status,
+                                      @RequestParam(required = false) String cursor,
+                                      @RequestParam(required = false) Integer limit) {
         ApiPrincipal principal = CurrentPrincipal.api();
+        int size = PagedResponse.clampLimit(limit);
+        int page = UpstreamPages.decodeCursor(cursor);
+
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
         addIfPresent(query, "status", status);
-        addIfPresent(query, "page", page == null ? null : String.valueOf(page));
-        addIfPresent(query, "size", size == null ? null
-                : String.valueOf(PagedResponse.clampLimit(size)));
-        return proxy(() -> tenantsClient.listCampaigns(principal.tenantId(), principal.keyId(), query));
+        UpstreamPages.pageParams(page, size).forEach(query::add);
+
+        JsonNode upstream = proxy(() ->
+                tenantsClient.listCampaigns(principal.tenantId(), principal.keyId(), query));
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     @GetMapping("/{id}")
@@ -121,17 +127,20 @@ public class CampaignsController {
                     Every recipient with its outcome, **including the ones that were not sent to** —
                     filter with `status=SUPPRESSED`, `SKIPPED_FREQUENCY` or `INVALID` to see exactly who
                     and why.""")
-    public JsonNode recipients(@PathVariable String id,
-                               @RequestParam(required = false) String status,
-                               @RequestParam(required = false) Integer page,
-                               @RequestParam(required = false) Integer size) {
+    public PagedResponse<Object> recipients(@PathVariable String id,
+                                           @RequestParam(required = false) String status,
+                                           @RequestParam(required = false) String cursor,
+                                           @RequestParam(required = false) Integer limit) {
         ApiPrincipal principal = CurrentPrincipal.api();
+        int size = PagedResponse.clampLimit(limit);
+        int page = UpstreamPages.decodeCursor(cursor);
+
         MultiValueMap<String, String> query = new LinkedMultiValueMap<>();
         addIfPresent(query, "status", status);
-        addIfPresent(query, "page", page == null ? null : String.valueOf(page));
-        addIfPresent(query, "size", size == null ? null
-                : String.valueOf(PagedResponse.clampLimit(size)));
-        return proxy(() -> tenantsClient.campaignRecipients(principal, id, query));
+        UpstreamPages.pageParams(page, size).forEach(query::add);
+
+        JsonNode upstream = proxy(() -> tenantsClient.campaignRecipients(principal, id, query));
+        return UpstreamPages.envelope(upstream, page, size, objectMapper);
     }
 
     @PostMapping("/{id}/recipients")

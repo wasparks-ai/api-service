@@ -279,6 +279,33 @@ id in the path and ignore the header.
 
 ---
 
+## Paginating a list
+
+Every list on this API answers in the same envelope:
+
+```json
+{ "data": [ … ],
+  "meta": { "next_cursor": "Mg" } }
+```
+
+Walk it by passing the previous response's `meta.next_cursor` back as `?cursor=`, and stop when
+`next_cursor` is absent. `?limit=` sets the page size (default 25, maximum 100).
+
+```bash
+curl "https://developer.wasparks.com/v1/campaigns?limit=50" -H "X-API-Key: …"
+curl "https://developer.wasparks.com/v1/campaigns?limit=50&cursor=Mg" -H "X-API-Key: …"
+```
+
+The cursor is opaque. Do not parse it, construct one, or do arithmetic on it — it is ours to change,
+and one you build yourself is rejected rather than silently restarting the walk you thought you were
+continuing.
+
+> `GET /v1/templates` is the one exception: it still returns the underlying paged shape
+> (`content`, `totalElements`) and takes `page`/`size`. It predates this envelope and is not being
+> changed under clients already using it.
+
+---
+
 ## Limits
 
 Your plan's allowance is **pooled**: one number shared by every customer plus your own account. On top of

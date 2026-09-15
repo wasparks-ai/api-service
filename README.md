@@ -62,7 +62,7 @@ boot — `ddl-auto=validate` will refuse to start otherwise, which is the point.
 mvn test
 ```
 
-230 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
+234 tests. They run against a **real PostgreSQL and a real Redis** through Testcontainers, so Docker
 must be running. The schema comes from `src/test/resources/db/schema-test.sql`, a trimmed transcript of
 the real migrations, and the entities are validated against it exactly as they are in production.
 
@@ -197,6 +197,10 @@ Image `wasparks/api-microservice`. Compose needs `redis` (`redis:7-alpine`, `--a
   endpoint this build needed that `internal.md` lacks.
 - **`app_access` is stored and reported but nothing acts on it** — the branded client login is a later
   phase of the partner epic.
+- **`GET /v1/templates` still returns tenants-service's paged shape**, not the `{data, meta}`
+  envelope every other collection read answers in. It shipped that way in P1 and is live, so
+  normalising it is a breaking change somebody has to decide on rather than a tidy-up;
+  `ListEnvelopeContractTest` names it as the one exemption so the gap is visible instead of absent.
 - **Two internal endpoints this build calls are not in `internal.md`**: `GET
   /internal/v1/tenants/{id}/settings` (only the PATCH is documented) and `GET
   /internal/v1/campaigns/across`. Both are implemented against the paths the hand-off named and read

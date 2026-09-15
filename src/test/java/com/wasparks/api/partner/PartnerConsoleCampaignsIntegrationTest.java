@@ -120,7 +120,10 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
 
         mockMvc.perform(get("/v1/partner/campaigns?customerId=self").header("Authorization", jwt()))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.content[0].id").value("c1"));
+                // The house envelope, not upstream's Spring page — the same shape the merged branch
+                // returns, which is the whole point of the endpoint having one contract.
+                .andExpect(jsonPath("$.data[0].id").value("c1"))
+                .andExpect(jsonPath("$.content").doesNotExist());
 
         Mockito.verify(tenantsClient, Mockito.never()).campaignsAcross(Mockito.any(), Mockito.any(),
                 Mockito.anyList(), Mockito.any());
@@ -136,7 +139,8 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
         mockMvc.perform(get("/v1/partner/campaigns?customerId=" + clientId)
                         .header("Authorization", jwt()))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.content[0].id").value("c9"));
+                .andExpect(jsonPath("$.data[0].id").value("c9"))
+                .andExpect(jsonPath("$.content").doesNotExist());
     }
 
     @Test
@@ -154,6 +158,30 @@ class PartnerConsoleCampaignsIntegrationTest extends BaseIntegrationTest {
                         .header("Authorization", jwt()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("validation_failed"));
+    }
+
+    @Test
+    @DisplayName("both branches of the campaigns list answer in the same envelope")
+    void bothBranchesAgreeOnTheShape() throws Exception {
+        UUID clientId = addClient(partnerId, "cust_1", null);
+        Mockito.when(tenantsClient.campaignsAcross(Mockito.any(), Mockito.any(), Mockito.anyList(),
+                        Mockito.any()))
+                .thenReturn(objectMapper.readTree(
+                        "{\"content\":[{\"id\":\"c1\",\"tenantId\":\"%s\"}]}".formatted(clientId)));
+        Mockito.when(tenantsClient.listCampaigns(Mockito.eq(clientId), Mockito.any(), Mockito.any()))
+                .thenReturn(objectMapper.readTree("{\"content\":[{\"id\":\"c1\"}]}"));
+
+        // A caller must not be able to tell which branch it took from the shape of the answer. This is
+        // the regression the envelope contract test exists to make structural; asserting it here as
+        // well is what proves the two actually agree at runtime rather than merely in their signatures.
+        for (String query : List.of("", "?customerId=" + clientId)) {
+            mockMvc.perform(get("/v1/partner/campaigns" + query).header("Authorization", jwt()))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data").isArray())
+                    .andExpect(jsonPath("$.data[0].id").value("c1"))
+                    .andExpect(jsonPath("$.content").doesNotExist())
+                    .andExpect(jsonPath("$.totalElements").doesNotExist());
+        }
     }
 
     // ------------------------------------------------------------------ recipients
